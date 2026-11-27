@@ -45,6 +45,28 @@ pub const RELEASE_SUITES: &[&str] = &[
 ];
 pub const SBX_NATIVE: &str = "native.macos-arm64-sbx";
 pub const SBX_SUITE: &str = "artifact-sbx-smoke";
+pub const APPLE_NATIVE: &str = "native.macos-arm64-apple";
+pub const DOCKER_NATIVE: &str = "native.linux-x64-docker";
+pub const APPLE_SUITE: &str = "artifact-apple-smoke";
+pub const DOCKER_SUITE: &str = "artifact-docker-smoke";
+pub const SBX_SMOKE_MAC: &str = "sbx.macos-arm64";
+pub const SBX_SMOKE_LINUX: &str = "sbx.linux-x64";
+pub const SBX_SMOKE_STEPS: &[&str] = &[
+    "version", "session", "create", "inspect", "exec", "run", "stop", "restart", "remove",
+    "cleanup",
+];
+pub const SBX_SMOKE_AGENT: &str = "claude";
+
+/// Independently checked grants; kit documents cannot widen host access.
+pub fn native_grants(id: &str) -> Result<&'static [&'static str]> {
+    Ok(match id {
+        "native.macos-arm64" | "native.linux-x64" => &["hypervisor", "offline"],
+        APPLE_NATIVE => &["apple-containers"],
+        DOCKER_NATIVE => &["docker"],
+        SBX_NATIVE => &["docker-sbx", "sbx-test-identity", "public-network"],
+        _ => anyhow::bail!("unknown native obligation {id}"),
+    })
+}
 pub const SBX_CASES: &[(&str, &str, &str, &str)] = &[
     (
         "claude",
@@ -65,6 +87,14 @@ pub fn native_tests(id: &str) -> Result<Vec<String>> {
             .iter()
             .map(|(_, name, _, _)| format!("awman-cli::artifact sbx_smoke::{name}"))
             .collect());
+    }
+    for (native, module) in [
+        (APPLE_NATIVE, "apple_smoke"),
+        (DOCKER_NATIVE, "docker_smoke"),
+    ] {
+        if id == native {
+            return Ok(vec![format!("awman-cli::artifact {module}::exact_asset_runs_a_synthetic_session_in_an_owned_container")]);
+        }
     }
     let names: &[&str] = match id {
         "native.macos-arm64" => &[
@@ -175,8 +205,8 @@ pub fn validate(m: &Manifest) -> Result<()> {
         "invalid evidence validity/retention"
     );
     ensure!(
-        m.release.native.len() == 3,
-        "two required native checks and the opt-in SBX diagnostic must remain registered"
+        m.release.native.len() == 5,
+        "four required native checks and the opt-in SBX diagnostic must remain registered"
     );
     for (id, asset, suite, fixture, arch) in [
         (
@@ -243,6 +273,132 @@ pub fn validate(m: &Manifest) -> Result<()> {
             "missing native critical test IDs"
         );
     }
+    for (id, asset, host, suite, fixture, arch, cap, group, critical) in [
+        (
+            APPLE_NATIVE,
+            "awman-macos-arm64",
+            "local",
+            APPLE_SUITE,
+            "guest-oci-base",
+            "arm64",
+            "apple-containers",
+            "apple",
+            "artifact.apple-container-session",
+        ),
+        (
+            DOCKER_NATIVE,
+            "awman-linux-amd64",
+            "ssh",
+            DOCKER_SUITE,
+            "guest-oci-base-amd64",
+            "amd64",
+            "docker",
+            "docker",
+            "artifact.docker-container-session",
+        ),
+    ] {
+        let n = m
+            .release
+            .native
+            .get(id)
+            .context("missing runtime native obligation")?;
+        ensure!(
+            n.required
+                && n.asset == asset
+                && n.host == host
+                && n.suites == [suite]
+                && n.fixtures == [fixture]
+                && n.previous_release.is_none()
+                && n.budget_seconds == 480,
+            "invalid runtime native obligation {id}"
+        );
+        ensure!(
+            m.fixtures
+                .get(fixture)
+                .context("missing runtime fixture")?
+                .arch
+                .as_deref()
+                == Some(arch),
+            "runtime fixture architecture mismatch"
+        );
+        let s = m.suites.get(suite).context("missing runtime suite")?;
+        ensure!(
+            s.tier == "artifact"
+                && s.kind == "nextest"
+                && s.package.as_deref() == Some("awman-cli")
+                && s.target.as_deref() == Some("test:artifact")
+                && s.contracts == [suite]
+                && s.requires == [cap, "guest-fixtures"]
+                && s.budget_seconds == Some(420)
+                && s.serial
+                && s.group.as_deref() == Some(group)
+                && s.filter.as_deref() == Some(native_filter(id)?.as_str()),
+            "invalid runtime suite {suite}"
+        );
+        let tests = native_tests(id)?;
+        ensure!(
+            m.release_critical
+                .iter()
+                .filter(|c| c.suite == suite)
+                .count()
+                == 1,
+            "runtime critical inventory must have one declaration"
+        );
+        ensure!(
+            m.release_critical.iter().any(|c| c.id == critical
+                && c.suite == suite
+                && c.not_overridable
+                && c.tests == tests
+                && c.gates.is_empty()),
+            "runtime critical test inventory differs: {id}"
+        );
+    }
+    ensure!(
+        m.release.sbx_smoke.len() == 2,
+        "exactly two SBX readiness declarations required"
+    );
+    for (id, asset, triple, host, selection) in [
+        (
+            SBX_SMOKE_MAC,
+            "awman-macos-arm64",
+            "aarch64-apple-darwin",
+            "local",
+            "always",
+        ),
+        (
+            SBX_SMOKE_LINUX,
+            "awman-linux-amd64",
+            "x86_64-unknown-linux-gnu",
+            "ssh",
+            "explicit-linux-host",
+        ),
+    ] {
+        let s = m
+            .release
+            .sbx_smoke
+            .get(id)
+            .context("missing SBX readiness declaration")?;
+        ensure!(
+            s.asset == asset
+                && s.triple == triple
+                && s.host == host
+                && s.selection == selection
+                && s.steps == SBX_SMOKE_STEPS
+                && s.ready_agent == SBX_SMOKE_AGENT
+                && s.min_cli_version == "0.54.0"
+                && s.lifecycle_budget_seconds == 600
+                && s.ready_budget_seconds == 420
+                && s.budget_seconds == 1080,
+            "invalid SBX readiness declaration {id}"
+        );
+    }
+    ensure!(
+        m.release
+            .native
+            .values()
+            .all(|n| !n.required || !n.suites.iter().any(|s| s == SBX_SUITE)),
+        "invalid opt-in SBX diagnostic; experimental provider smoke must not gate release"
+    );
     let sbx = m
         .release
         .native
@@ -273,6 +429,12 @@ pub fn validate(m: &Manifest) -> Result<()> {
         "SBX suite must select exactly the two smoke cases"
     );
     for (id, other) in &m.suites {
+        for (cap, suite) in [("docker", DOCKER_SUITE), ("apple-containers", APPLE_SUITE)] {
+            ensure!(
+                other.tier != "artifact" || id == suite || !other.requires.iter().any(|c| c == cap),
+                "runtime artifact grant restricted to {suite}"
+            );
+        }
         ensure!(
             other.tier != "artifact"
                 || id == SBX_SUITE
@@ -285,8 +447,10 @@ pub fn validate(m: &Manifest) -> Result<()> {
     }
     for gate in m.gates.keys() {
         ensure!(
-            !cells(m, gate)?.iter().any(|c| c.suite == SBX_SUITE),
-            "SBX smoke is native-only"
+            !cells(m, gate)?
+                .iter()
+                .any(|c| [SBX_SUITE, APPLE_SUITE, DOCKER_SUITE].contains(&c.suite.as_str())),
+            "runtime smoke is native-only"
         );
     }
     ensure!(
@@ -393,4 +557,152 @@ pub fn native_filter(id: &str) -> Result<String> {
         .map(|t| format!("test(={})", t.split_once(' ').unwrap().1))
         .collect::<Vec<_>>()
         .join(" | "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn manifest() -> Manifest {
+        crate::manifest::parse(include_bytes!("../../../ci/gates.toml")).unwrap()
+    }
+    #[test]
+    fn native_inventory_and_grants_are_narrow_and_provider_sbx_stays_optional() {
+        let m = manifest();
+        validate(&m).unwrap();
+        assert_eq!(m.release.native.values().filter(|n| n.required).count(), 4);
+        assert!(!m.release.native[SBX_NATIVE].required);
+        for (id, suite, cap, module) in [
+            (APPLE_NATIVE, APPLE_SUITE, "apple-containers", "apple_smoke"),
+            (DOCKER_NATIVE, DOCKER_SUITE, "docker", "docker_smoke"),
+        ] {
+            assert_eq!(native_grants(id).unwrap(), [cap]);
+            assert_eq!(m.release.native[id].suites, [suite]);
+            assert_eq!(native_tests(id).unwrap(), [format!("awman-cli::artifact {module}::exact_asset_runs_a_synthetic_session_in_an_owned_container")]);
+            assert_eq!(
+                native_filter(id).unwrap(),
+                m.suites[suite].filter.clone().unwrap()
+            );
+        }
+        assert!(native_grants("native.windows").is_err());
+        assert!(native_tests("native.linux-arm64").is_err());
+    }
+    #[test]
+    fn readiness_rejects_changed_host_asset_selection_steps_agent_and_budgets() {
+        for id in [SBX_SMOKE_MAC, SBX_SMOKE_LINUX] {
+            for field in [
+                "asset",
+                "triple",
+                "host",
+                "selection",
+                "ready_agent",
+                "min_cli_version",
+            ] {
+                let mut m = manifest();
+                let s = m.release.sbx_smoke.get_mut(id).unwrap();
+                let value = match field {
+                    "asset" => &mut s.asset,
+                    "triple" => &mut s.triple,
+                    "host" => &mut s.host,
+                    "selection" => &mut s.selection,
+                    "ready_agent" => &mut s.ready_agent,
+                    _ => &mut s.min_cli_version,
+                };
+                *value = "disallowed".into();
+                assert!(validate(&m).is_err(), "{id}: {field}");
+            }
+            for field in 0..4 {
+                let mut m = manifest();
+                let s = m.release.sbx_smoke.get_mut(id).unwrap();
+                match field {
+                    0 => s.steps.swap(0, 1),
+                    1 => s.lifecycle_budget_seconds += 1,
+                    2 => s.ready_budget_seconds += 1,
+                    _ => s.budget_seconds += 1,
+                }
+                assert!(validate(&m).is_err());
+            }
+        }
+        let mut m = manifest();
+        m.release.sbx_smoke.remove(SBX_SMOKE_LINUX);
+        assert!(validate(&m).is_err());
+        let mut m = manifest();
+        m.release.sbx_smoke.insert(
+            "sbx.linux-arm64".into(),
+            m.release.sbx_smoke[SBX_SMOKE_LINUX].clone(),
+        );
+        assert!(validate(&m).is_err());
+        let text = std::str::from_utf8(include_bytes!("../../../ci/gates.toml")).unwrap();
+        assert!(crate::manifest::parse(
+            text.replace(
+                "selection = \"always\"",
+                "selection = \"always\"\nsuites = [\"artifact-sbx-smoke\"]"
+            )
+            .as_bytes()
+        )
+        .is_err());
+    }
+    #[test]
+    fn runtime_inventory_and_native_hosts_cannot_be_widened_or_waived() {
+        for (id, suite, other) in [
+            (APPLE_NATIVE, APPLE_SUITE, "docker"),
+            (DOCKER_NATIVE, DOCKER_SUITE, "apple-containers"),
+        ] {
+            for field in 0..8 {
+                let mut m = manifest();
+                let n = m.release.native.get_mut(id).unwrap();
+                match field {
+                    0 => n.required = false,
+                    1 => n.host = "other".into(),
+                    2 => n.asset = "awman-linux-arm64".into(),
+                    3 => n.budget_seconds += 1,
+                    4 => n.suites.push(SBX_SUITE.into()),
+                    5 => n.previous_release = Some("aarch64-apple-darwin".into()),
+                    6 => m.suites.get_mut(suite).unwrap().requires.push(other.into()),
+                    _ => m.suites.get_mut(suite).unwrap().filter = Some("all()".into()),
+                }
+                assert!(validate(&m).is_err(), "{id}: {field}");
+            }
+            let mut m = manifest();
+            m.release_critical
+                .iter_mut()
+                .find(|c| c.suite == suite)
+                .unwrap()
+                .tests
+                .push("awman-cli::artifact unexpected".into());
+            assert!(validate(&m).is_err());
+            let mut m = manifest();
+            m.gates.get_mut("release").unwrap().cells[0]
+                .suites
+                .push(suite.into());
+            assert!(validate(&m).is_err());
+        }
+        let mut m = manifest();
+        m.release.native.get_mut(SBX_NATIVE).unwrap().required = true;
+        assert!(validate(&m).is_err());
+        for cap in ["apple-containers", "docker"] {
+            let mut m = manifest();
+            m.suites
+                .get_mut("artifact-smoke")
+                .unwrap()
+                .requires
+                .push(cap.into());
+            assert!(validate(&m).is_err());
+        }
+    }
+    #[test]
+    fn readiness_and_runtime_changes_are_bound_into_policy_digest() {
+        let m = manifest();
+        let before = digest(&m).unwrap();
+        let mut other = m.clone();
+        other
+            .release
+            .sbx_smoke
+            .get_mut(SBX_SMOKE_MAC)
+            .unwrap()
+            .ready_agent = "other".into();
+        assert_ne!(before, digest(&other).unwrap());
+        let mut other = m.clone();
+        other.suites.get_mut(APPLE_SUITE).unwrap().filter = Some("all()".into());
+        assert_ne!(before, digest(&other).unwrap());
+    }
 }

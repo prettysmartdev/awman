@@ -207,6 +207,106 @@
       "budget_seconds": 1500,
       "required": true,
       "kit_artifact": "native-kit-native.macos-arm64-sbx"
+    },
+    {
+      "id": "native.macos-arm64-apple",
+      "asset": "awman-macos-arm64",
+      "host": "local",
+      "triple": "aarch64-apple-darwin",
+      "suites": [
+        "artifact-apple-smoke"
+      ],
+      "tests": [
+        "awman-cli::artifact apple_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"
+      ],
+      "fixtures": [
+        {
+          "id": "guest-oci-base",
+          "file": "guest-oci-base.tar",
+          "arch": "arm64",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "url": "https://github.com/prettysmartdev/awman/releases/download/fixtures-0000000000000000000000000000000000000000/fixture-oci.tar"
+        }
+      ],
+      "previous_release": null,
+      "budget_seconds": 480,
+      "required": true,
+      "kit_artifact": "native-kit-native.macos-arm64-apple"
+    },
+    {
+      "id": "native.linux-x64-docker",
+      "asset": "awman-linux-amd64",
+      "host": "ssh",
+      "triple": "x86_64-unknown-linux-gnu",
+      "suites": [
+        "artifact-docker-smoke"
+      ],
+      "tests": [
+        "awman-cli::artifact docker_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"
+      ],
+      "fixtures": [
+        {
+          "id": "guest-oci-base-amd64",
+          "file": "guest-oci-base-amd64.tar",
+          "arch": "amd64",
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "url": "https://github.com/prettysmartdev/awman/releases/download/fixtures-amd64-0000000000000000000000000000000000000000/fixture-oci-amd64.tar"
+        }
+      ],
+      "previous_release": null,
+      "budget_seconds": 480,
+      "required": true,
+      "kit_artifact": "native-kit-native.linux-x64-docker"
+    }
+  ],
+  "sbx_smoke": [
+    {
+      "id": "sbx.macos-arm64",
+      "asset": "awman-macos-arm64",
+      "triple": "aarch64-apple-darwin",
+      "host": "local",
+      "selection": "always",
+      "steps": [
+        "version",
+        "session",
+        "create",
+        "inspect",
+        "exec",
+        "run",
+        "stop",
+        "restart",
+        "remove",
+        "cleanup"
+      ],
+      "ready_agent": "claude",
+      "min_cli_version": "0.54.0",
+      "lifecycle_budget_seconds": 600,
+      "ready_budget_seconds": 420,
+      "budget_seconds": 1080
+    },
+    {
+      "id": "sbx.linux-x64",
+      "asset": "awman-linux-amd64",
+      "triple": "x86_64-unknown-linux-gnu",
+      "host": "ssh",
+      "selection": "explicit-linux-host",
+      "steps": [
+        "version",
+        "session",
+        "create",
+        "inspect",
+        "exec",
+        "run",
+        "stop",
+        "restart",
+        "remove",
+        "cleanup"
+      ],
+      "ready_agent": "claude",
+      "min_cli_version": "0.54.0",
+      "lifecycle_budget_seconds": 600,
+      "ready_budget_seconds": 420,
+      "budget_seconds": 1080
     }
   ]
 }

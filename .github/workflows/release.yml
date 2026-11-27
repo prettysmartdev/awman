@@ -137,6 +137,68 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      - name: Checkpoint availability for native.linux-x64-docker
+        id: native_linux_x64_docker
+        if: ${{ inputs.asset == 'awman-linux-amd64' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts")
+          expired=$(printf '%s' "$artifacts" | jq --arg name "native-kit-native.linux-x64-docker" '[.artifacts[] | select(.name == $name and .expired == true)] | length')
+          count=$(printf '%s' "$artifacts" | jq --arg name "native-kit-native.linux-x64-docker" '[.artifacts[] | select(.name == $name and .expired == false)] | length')
+          [ "$expired" -eq 0 ] && [ "$count" -le 1 ] || { echo 'expired or ambiguous native kit checkpoint' >&2; exit 1; }
+          echo "reuse=$([ "$count" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Native test kit native.linux-x64-docker
+        if: ${{ inputs.asset == 'awman-linux-amd64' && steps.native_linux_x64_docker.outputs.reuse != 'true' }}
+        run: |
+          mkdir -p out
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test install-runner
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test kit --native 'native.linux-x64-docker' --commit "$COMMIT" --out "$RUNNER_TEMP/kit-native.linux-x64-docker"
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- release kit-pack --dir "$RUNNER_TEMP/kit-native.linux-x64-docker" --out 'out/native-kit-native.linux-x64-docker.tar'
+      - name: Attest native kit native.linux-x64-docker
+        if: ${{ inputs.asset == 'awman-linux-amd64' && steps.native_linux_x64_docker.outputs.reuse != 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/native-kit-native.linux-x64-docker.tar
+      - name: Checkpoint native kit native.linux-x64-docker
+        if: ${{ inputs.asset == 'awman-linux-amd64' && steps.native_linux_x64_docker.outputs.reuse != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-kit-native.linux-x64-docker
+          path: out/native-kit-native.linux-x64-docker.tar
+          if-no-files-found: error
+          retention-days: 90
+      - name: Checkpoint availability for native.macos-arm64-apple
+        id: native_macos_arm64_apple
+        if: ${{ inputs.asset == 'awman-macos-arm64' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts")
+          expired=$(printf '%s' "$artifacts" | jq --arg name "native-kit-native.macos-arm64-apple" '[.artifacts[] | select(.name == $name and .expired == true)] | length')
+          count=$(printf '%s' "$artifacts" | jq --arg name "native-kit-native.macos-arm64-apple" '[.artifacts[] | select(.name == $name and .expired == false)] | length')
+          [ "$expired" -eq 0 ] && [ "$count" -le 1 ] || { echo 'expired or ambiguous native kit checkpoint' >&2; exit 1; }
+          echo "reuse=$([ "$count" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Native test kit native.macos-arm64-apple
+        if: ${{ inputs.asset == 'awman-macos-arm64' && steps.native_macos_arm64_apple.outputs.reuse != 'true' }}
+        run: |
+          mkdir -p out
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test install-runner
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test kit --native 'native.macos-arm64-apple' --commit "$COMMIT" --out "$RUNNER_TEMP/kit-native.macos-arm64-apple"
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- release kit-pack --dir "$RUNNER_TEMP/kit-native.macos-arm64-apple" --out 'out/native-kit-native.macos-arm64-apple.tar'
+      - name: Attest native kit native.macos-arm64-apple
+        if: ${{ inputs.asset == 'awman-macos-arm64' && steps.native_macos_arm64_apple.outputs.reuse != 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/native-kit-native.macos-arm64-apple.tar
+      - name: Checkpoint native kit native.macos-arm64-apple
+        if: ${{ inputs.asset == 'awman-macos-arm64' && steps.native_macos_arm64_apple.outputs.reuse != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-kit-native.macos-arm64-apple
+          path: out/native-kit-native.macos-arm64-apple.tar
+          if-no-files-found: error
+          retention-days: 90
 
   validate:
     name: Validate ${{ inputs.asset }}

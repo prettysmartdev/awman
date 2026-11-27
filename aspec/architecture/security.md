@@ -240,20 +240,35 @@ commit every attestation names as its source. Branch protection, approval rules
 and tag rulesets are optional repository settings; preflight reports the ones
 this login cannot satisfy but they are not admission requirements.
 
-Native guest checks run on the operator's Apple Silicon Mac and on a Linux KVM
-host reached over SSH, from a prebuilt kit whose archive is attested and whose
-files are bound by a digest manifest. The kit is extracted only after
+Native guest, Apple Containers and Docker checks run on the operator's Apple
+Silicon Mac and on a Linux host reached over SSH, from prebuilt kits whose
+archives are attested and whose files are bound by a digest manifest. The kit is extracted only after
 verification, into a fresh owned root, rejecting absolute or traversing paths,
 links, devices, duplicates and oversized expansion; only allowlisted kit files
 keep executable bits. Nothing is compiled, signed or rebuilt on a native host,
-no GitHub token or other credential is sent to it, no Docker or checkout is
-required on it, and any host work is tied to an owner lease so that only
-identified owned descendants are ever terminated. Hosts allocate private
-short roots (mode 0700, no-follow). Synthetic task agents run only inside the
-guest booted by the exact asset with a private test repository as the only
-mount; the controller checkout and parent directories are never mounted. The
-`HostAgentPinger` exception above is unchanged: the release command adds no
-trigger and no second host-agent mechanism. Native results are operator
+no GitHub token or other credential is sent to it, no checkout is required on
+it, and any host work is tied to an owner lease so that only identified owned
+descendants are ever terminated. Hosts allocate private short roots (mode 0700,
+no-follow). Synthetic task agents run only inside the guest or container started
+by the exact asset; every host mount lies within the check's private state, no
+parent of the private test repository is mounted, and the controller checkout is
+never mounted. Apple Containers and Docker objects are removed only by names,
+tags and an owner label reserved for that run, never by pruning, and a leaked or
+unverifiable object voids the result.
+
+The release SBX smoke uses the operator's existing `sbx` login on the Mac and,
+only when explicitly selected, on the Linux host. It never logs in or out, reads
+no provider key or keychain, passes no secret to a sandbox and runs no agent or
+provider task: a disposable shell sandbox on a private scratch workspace, then
+preparation-only readiness through the exact asset with authentication mode
+`none`, credential refresh disabled, private `AWMAN_HOME` and a private empty
+repository. The Linux host receives a fixed script and the asset bytes over SSH
+with agent forwarding disabled. Ownership is recorded before the first mutation
+and cleanup removes only what that record names. It does not establish provider
+authentication or effective agent policy.
+
+The `HostAgentPinger` exception above is unchanged: the release command adds no
+trigger and no second host-agent mechanism. Native and SBX results are operator
 evidence, not Actions attestations; the build provenance of every asset is
 an Actions attestation, and publication requires both. Native kill and
 containment behavior on macOS and Windows must be validated on the real

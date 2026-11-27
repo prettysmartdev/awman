@@ -82,7 +82,54 @@ pub trait Prompt {
 
 /// Creates the host for one native check. Production chooses `LocalHost`
 /// for `host = "local"` and `SshHost` for `host = "ssh"`.
+#[allow(private_interfaces)]
 pub trait Hosts {
+    fn sbx_smoke_reconcile(&self, job: &super::runtime_smoke::sbx::SbxSmokeJob) -> Step {
+        super::runtime_smoke::sbx::reconcile(job)
+            .map(|_| ())
+            .map_err(|e| Stop::new("sbx-smoke-failed", format!("owned cleanup: {e}")))
+    }
+    fn sbx_smoke_probe(
+        &self,
+        target: &super::runtime_smoke::sbx::Target,
+        min: &str,
+    ) -> Step<super::runtime_smoke::sbx::CliIdentity> {
+        super::runtime_smoke::sbx::probe(target, min, std::path::Path::new("ssh"))
+            .map_err(|(code, message)| Stop::new("sbx-smoke-blocked", format!("{code}: {message}")))
+    }
+    fn sbx_smoke_identity(
+        &self,
+        target: &super::runtime_smoke::sbx::Target,
+    ) -> Step<super::runtime_smoke::sbx::CliIdentity> {
+        super::runtime_smoke::sbx::cli_identity(target, std::path::Path::new("ssh"))
+            .map_err(|(code, message)| Stop::new("sbx-smoke-blocked", format!("{code}: {message}")))
+    }
+    fn sbx_smoke_start(
+        &self,
+        job: super::runtime_smoke::sbx::SbxSmokeJob,
+    ) -> Step<std::thread::JoinHandle<Step<super::runtime_smoke::sbx::SbxSmokeRecord>>> {
+        Ok(std::thread::spawn(move || {
+            super::runtime_smoke::sbx::run(&job).map_err(|e| {
+                Stop::new(
+                    if job.interrupted.load(std::sync::atomic::Ordering::SeqCst) {
+                        "interrupted"
+                    } else {
+                        "sbx-smoke-invalid"
+                    },
+                    e.to_string(),
+                )
+            })?;
+            super::runtime_smoke::sbx::verify_report(&job)
+                .map_err(|e| Stop::new("sbx-smoke-invalid", e.to_string()))
+        }))
+    }
+    fn sbx_smoke_verify(
+        &self,
+        job: &super::runtime_smoke::sbx::SbxSmokeJob,
+    ) -> Step<super::runtime_smoke::sbx::SbxSmokeRecord> {
+        super::runtime_smoke::sbx::verify_report(job)
+            .map_err(|e| Stop::new("sbx-smoke-invalid", e.to_string()))
+    }
     fn sbx_qualification(&self) -> Step<super::sbx::Qualification>;
     fn host(&self, plan: &NativePlan, linux_host: Option<&str>) -> Step<Box<dyn NativeHost>>;
 }

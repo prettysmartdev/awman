@@ -50,6 +50,7 @@ pub struct Ctx<'a> {
     pub plan: Plan,
     pub repo: RepoInfo,
     pub linux_host: Option<String>,
+    pub sbx_explicit_host: Option<String>,
     pub previous_owners: Vec<Owner>,
     /// Native errors held back so hosted work keeps going (design 3.4).
     pub deferred: Vec<Stop>,
@@ -60,6 +61,8 @@ pub struct Ctx<'a> {
     pub hosts: BTreeMap<String, Box<dyn super::native::NativeHost + 'a>>,
     /// Monotonic start of this invocation (bootstrap included).
     pub invoked: std::time::Instant,
+    pub(crate) sbx_workers:
+        BTreeMap<String, std::thread::JoinHandle<Step<super::runtime_smoke::sbx::SbxSmokeRecord>>>,
 }
 
 impl Ctx<'_> {
@@ -209,6 +212,17 @@ fn parse_claim(c: &super::forge::Claim) -> Step<ClaimDoc> {
     })
 }
 
+fn check_linux_destination(frozen: Option<&str>, current: Option<&str>) -> Step {
+    if frozen == current {
+        Ok(())
+    } else {
+        Err(Stop::new(
+            "linux-host-changed",
+            "the KVM/Docker SSH destination differs from the frozen attempt",
+        ))
+    }
+}
+
 /// A journal rebuilt from the remote claim after the private state was lost:
 /// identity, plan and run IDs survive; local bytes are re-downloaded by
 /// pinned artifact ID, and a sealed attempt keeps its seal.
@@ -254,8 +268,12 @@ fn rebuild(
         ci: Default::default(),
         builds: BTreeMap::new(),
         native: BTreeMap::new(),
+        sbx_selection: None,
+        linux_host: doc.linux_host.clone(),
+        sbx_smoke: BTreeMap::new(),
         release: Default::default(),
     };
+    j.sbx_selection = doc.sbx_selection.clone();
     let done = |j: &mut Journal, phase: &str| {
         j.phases.insert(
             phase.into(),
@@ -363,6 +381,15 @@ fn restore_sealed_evidence(
         b.validated = time(&a["validated"]);
     }
     j.native = serde_json::from_value(ev["native"].clone()).unwrap_or_default();
+    let selection =
+        serde_json::from_value(ev["sbx_selection"].clone()).map_err(anyhow::Error::from)?;
+    if j.sbx_selection != selection || j.linux_host.as_deref() != ev["linux_host"].as_str() {
+        return Err(Stop::new(
+            "seal-mismatch",
+            "sealed SBX selection differs from claim",
+        ));
+    }
+    j.sbx_smoke = serde_json::from_value(ev["sbx_smoke"].clone()).map_err(anyhow::Error::from)?;
     Ok(())
 }
 
@@ -482,7 +509,12 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
         }
         previous_owners = doc.previous_owners.clone();
         match &journal {
-            Some(j) if j.commit != doc.commit || j.generation != doc.generation => {
+            Some(j)
+                if j.commit != doc.commit
+                    || j.generation != doc.generation
+                    || j.sbx_selection != doc.sbx_selection
+                    || j.linux_host != doc.linux_host =>
+            {
                 return Err(Stop::new(
                     "state-foreign",
                     format!(
@@ -574,20 +606,25 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
                     "the Linux native check is unfinished and no LINUX_HOST is set",
                 ));
             }
+            let frozen_linux_host = j.linux_host.clone();
             let mut ctx = Ctx {
                 w,
                 store,
                 j,
                 plan,
                 repo,
-                linux_host,
+                linux_host: frozen_linux_host,
+                sbx_explicit_host: opts.linux_host.clone(),
                 previous_owners,
                 deferred: Vec::new(),
                 retried: BTreeSet::new(),
                 controller_sha256: controller_sha256(),
                 hosts: BTreeMap::new(),
                 invoked,
+                sbx_workers: BTreeMap::new(),
             };
+            super::runtime_smoke::selection_check(&ctx, opts.linux_host.as_deref())?;
+            check_linux_destination(ctx.j.linux_host.as_deref(), linux_host.as_deref())?;
             if took_over {
                 // Record the new owner (and keep the old one) before any mutation.
                 ctx.update_claim(None)?;
@@ -618,6 +655,7 @@ fn remaining(j: &Journal, plan: &Plan) -> (BTreeSet<&'static str>, Vec<String>) 
 
 fn resume_checks(ctx: &mut Ctx) -> Step {
     ctx.timing("preflight", "start", "resume");
+    super::runtime_smoke::resume(ctx)?;
     // Reuse a passed SBX check only for the same currently qualified CLI and identity.
     // Sealed evidence is immutable and publication retries need no native host.
     let sbx_id = crate::manifest::release_policy::SBX_NATIVE;
@@ -735,6 +773,12 @@ fn start_new(
         linux_host.as_deref(),
         &store.path("fixtures"),
     )?;
+    super::runtime_smoke::preflight(
+        w,
+        &plan,
+        &super::runtime_smoke::selection(opts.linux_host.as_deref())?,
+        &BTreeMap::new(),
+    )?;
     store.timing(w.clock.now(), "preflight", "finish", "new attempt");
     if let Some(h) = &linux_host {
         w.source.config_set("awman.release.linuxHost", h);
@@ -781,8 +825,12 @@ fn start_new(
         ci: Default::default(),
         builds: BTreeMap::new(),
         native: BTreeMap::new(),
+        sbx_selection: None,
+        linux_host: linux_host.clone(),
+        sbx_smoke: BTreeMap::new(),
         release: Default::default(),
     };
+    j.sbx_selection = Some(super::runtime_smoke::selection(opts.linux_host.as_deref())?);
     j.phases.insert(
         "preflight".into(),
         PhaseRecord {
@@ -808,12 +856,14 @@ fn start_new(
         plan,
         repo: repo.clone(),
         linux_host,
+        sbx_explicit_host: opts.linux_host.clone(),
         previous_owners,
         deferred: Vec::new(),
         retried: BTreeSet::new(),
         controller_sha256: controller_sha256(),
         hosts: BTreeMap::new(),
         invoked,
+        sbx_workers: BTreeMap::new(),
     };
     drive(&mut ctx)
 }
@@ -917,6 +967,7 @@ fn still_done(ctx: &mut Ctx, phase: &str) -> Step<bool> {
 /// nothing, exactly like SIGKILL.
 pub fn drive(ctx: &mut Ctx) -> Step {
     let result = drive_phases(ctx);
+    super::runtime_smoke::drain(ctx);
     if matches!(&result, Err(s) if s.kind == Kind::Killed) {
         return result;
     }
@@ -1070,6 +1121,7 @@ fn supersede(w: &World, store: &Store, root: &StateRoot, j: &Journal) -> Step {
             format!("{} is sealed or tagged; its bytes cannot change", j.version),
         ));
     }
+    super::runtime_smoke::cleanup_attempt(w, store, j)?;
     if let Some(id) = j.release.draft_id {
         let marker = super::evidence::draft_marker(&j.operation);
         if w.forge
@@ -1090,7 +1142,15 @@ fn supersede(w: &World, store: &Store, root: &StateRoot, j: &Journal) -> Step {
     for f in ["state.json", "plan.json", "timings.jsonl"] {
         let _ = std::fs::rename(store.path(f), archive.join(f));
     }
-    for d in ["assets", "kits", "native", "evidence", "ci", "logs"] {
+    for d in [
+        "assets",
+        "kits",
+        "native",
+        "sbx-smoke",
+        "evidence",
+        "ci",
+        "logs",
+    ] {
         let _ = std::fs::rename(store.path(d), archive.join(d));
         super::util::private_dir(&store.path(d))?;
     }
@@ -1150,10 +1210,34 @@ fn doctor(
     w.source.remove_checkout(&scratch.join("src"));
     r?;
     let _ = owner;
+    super::runtime_smoke::preflight(
+        w,
+        &plan,
+        &super::runtime_smoke::selection(opts.linux_host.as_deref())?,
+        &BTreeMap::new(),
+    )?;
     println!(
         "release-doctor: environment prepared for {version} ({} assets, {} native checks)",
         plan.assets.len(),
         plan.native.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_kvm_docker_destination_cannot_change_on_resume() {
+        assert!(check_linux_destination(Some("build@A"), Some("build@A")).is_ok());
+        let changed = check_linux_destination(Some("build@A"), Some("build@B")).unwrap_err();
+        assert_eq!(changed.code, "linux-host-changed");
+        assert_eq!(
+            check_linux_destination(Some("build@A"), None)
+                .unwrap_err()
+                .code,
+            "linux-host-changed"
+        );
+    }
 }

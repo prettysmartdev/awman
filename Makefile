@@ -155,14 +155,17 @@ clean:
 
 # ── Release ──────────────────────────────────────────────────────────────────
 # One command starts or resumes a release from the Apple Silicon Mac: it
-# dispatches the hosted release gate and asset builds, runs the two native
-# checks (this Mac and LINUX_HOST over SSH), seals the draft, asks once for
-# confirmation, then lands, tags, publishes and verifies. After any stop,
+# dispatches the hosted release gate and asset builds, runs both native guest
+# checks, Apple Containers, Linux Docker and the selected SBX lifecycle checks,
+# seals the draft, asks once for confirmation, then lands, tags, publishes and
+# verifies. After any stop,
 # run the same command again: completed work is kept. See
 # aspec/devops/release.md.
 #
 #   make release [VERSION=vX.Y.Z] [LINUX_HOST=user@host] [YES=1]
 #                [SUPERSEDE=1] [TAKEOVER=<owner>] [REHEARSE=1]
+# LINUX_HOST is passed only when explicitly supplied; Git config fallback is
+# for the required KVM/Docker host and must never select Linux SBX.
 RELEASE_ARGS = $(if $(VERSION),--version $(VERSION)) $(if $(LINUX_HOST),--linux-host $(LINUX_HOST))
 .PHONY: release release-status release-doctor release-abandon release-rehearse fixtures-pin
 # One-time fixture preparation, separate from the timed release. Publishes a
@@ -177,8 +180,8 @@ release:
 release-status:
 	@cargo xtask release status --version "$(VERSION)" $(if $(filter 1,$(REHEARSE)),--rehearse) $(if $(REHEARSAL_REPO),--rehearsal-repo $(REHEARSAL_REPO))
 
-# Prerequisites only (tools, GitHub capabilities, workflows, both native
-# hosts, pinned inputs); changes nothing.
+# Prerequisites only: tools, GitHub, fixtures, Apple Containers, Linux KVM/Docker,
+# Mac SBX CLI/login, and Linux SBX only when LINUX_HOST is explicit.
 release-doctor:
 	@cargo xtask release doctor $(RELEASE_ARGS)
 

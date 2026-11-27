@@ -206,7 +206,7 @@ fn the_checked_in_plan_fixture_is_a_complete_consumer_contract() {
     assert_eq!(plan["schema"], 1);
     assert_eq!(plan["assets"].as_array().unwrap().len(), 4);
     let natives = plan["native"].as_array().unwrap();
-    assert_eq!(natives.len(), 2);
+    assert_eq!(natives.len(), 4);
     assert!(natives
         .iter()
         .all(|n| n["required"] == true && n.get("waivable").is_none()));

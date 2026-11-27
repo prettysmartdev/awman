@@ -4,6 +4,10 @@ use crate::evidence::{actions, digest, junit, schema::Outcome};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+#[allow(dead_code)] // The archive writer is used by the artifact binary and component tests.
+#[path = "../../../tests/artifact/support/runtime_owned.rs"]
+mod runtime_owned;
+use runtime_owned::Service;
 
 #[derive(Parser)]
 struct BuildArgs {
@@ -331,6 +335,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
     let started = chrono::Utc::now();
     let mut result = serde_json::json!({"schema":1,"native_id":null,"commit":null,"tree":null,"artifact_sha256":a.artifact_sha256,"kit_sha256":null,"outcome":"blocked","reason":null,"reason_code":"kit-corrupt","tests":[],"host":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"os_build":null},"started":started,"finished":null});
+    let mut runtime_service: Option<RuntimeService> = None;
     let mut sbx_check = a.native.as_deref() == Some(crate::manifest::release_policy::SBX_NATIVE);
     let checked = (|| -> Result<()> {
         let root = a.kit.canonicalize()?;
@@ -461,8 +466,15 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
                 "fixture-digest: predecessor mismatch"
             );
         }
+        let capabilities: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("capabilities.json"))?)?;
+        let grants: Vec<String> = serde_json::from_value(capabilities["grants"].clone())?;
+        ensure!(
+            grants == crate::manifest::release_policy::native_grants(&kit.native_id)?,
+            "kit-corrupt: invalid native capability grant"
+        );
         #[cfg(target_os = "linux")]
-        if !sbx_check {
+        if grants.iter().any(|g| g == "hypervisor") {
             let kvm = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -470,7 +482,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             ensure!(kvm.is_ok(), "no-hypervisor: read/write /dev/kvm required");
         }
         #[cfg(target_os = "macos")]
-        if !sbx_check {
+        if grants.iter().any(|g| g == "hypervisor") {
             let hv = Command::new("/usr/sbin/sysctl")
                 .args(["-n", "kern.hv_support"])
                 .output()?;
@@ -501,18 +513,18 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
         } else {
             None
         };
-        let capabilities: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("capabilities.json"))?)?;
-        let grants: Vec<String> = serde_json::from_value(capabilities["grants"].clone())?;
-        let expected_grants = if sbx_check {
-            vec!["docker-sbx", "sbx-test-identity", "public-network"]
+        runtime_service = RuntimeService::probe(&kit.native_id)?;
+        let resources = if let Some(service) = &runtime_service {
+            result["service"] = service.identity()?;
+            reserve_runtime(&a.out, &a.tmproot, service, kit.budget_seconds)?;
+            if let Some(engine) = &service.engine {
+                format!("docker={engine}")
+            } else {
+                "apple-containers".to_owned()
+            }
         } else {
-            vec!["hypervisor", "offline"]
+            grants.join(",")
         };
-        ensure!(
-            grants == expected_grants,
-            "kit-corrupt: invalid native capability grant"
-        );
         if sbx_check {
             crate::release::sbx::allocate(&a.out, &a.tmproot)?;
         }
@@ -558,7 +570,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
                 .env("AWMAN_TEST_TIER", "artifact")
                 .env("AWMAN_TEST_TMPROOT", &a.tmproot)
                 .env("AWMAN_TEST_EVIDENCE_DIR", absolute(&a.out)?)
-                .env("AWMAN_TEST_HOST_RESOURCES", grants.join(","));
+                .env("AWMAN_TEST_HOST_RESOURCES", &resources);
             if sbx_check { crate::release::sbx::grant(&mut command)?; }
             let log = std::fs::File::create(a.out.join("runner.log"))?;
             command.stdout(log.try_clone()?).stderr(log);
@@ -614,8 +626,28 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
         } else {
             Ok(false)
         };
+        let runtime_cleaned = if let Some(service) = &runtime_service {
+            reconcile_runtime(&a.out, &a.tmproot, service)
+        } else {
+            Ok(false)
+        };
         let swept = isolation.finish();
         enforce_cleanup(cleaned, swept)?;
+        enforce_cleanup(runtime_cleaned, Ok(()))?;
+        if let Some(service) = &runtime_service {
+            ensure!(
+                result["service"]["cli_sha256"] == digest::sha256_file(&service.cli)?,
+                "service CLI changed during the check"
+            );
+            if a.out.join("runtime-smoke.json").exists() {
+                result["runtime_smoke_sha256"] =
+                    serde_json::json!(digest::sha256_file(&a.out.join("runtime-smoke.json"))?);
+            }
+            result["runtime_reconcile_sha256"] =
+                serde_json::json!(digest::sha256_file(&a.out.join("runtime-reconcile.json"))?);
+            result["runtime_owned_sha256"] =
+                serde_json::json!(digest::sha256_file(&a.out.join("runtime-owned.json"))?);
+        }
         let (status, records) = ran?;
         if records.iter().any(|r| r.outcome == Outcome::Blocked) {
             return Err(crate::release::error::Stop::new("native-blocked", "required test reported blocked; inspect runner.log and JUnit for the missing capability").into());
@@ -638,6 +670,13 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
         Err(e) => {
             let reason = format!("{e:#}");
             let code = blocked_reason(sbx_check, &e);
+            // A service was admitted and execution exceeded its bound: this is
+            // a failed runtime check, not a retryable missing prerequisite.
+            let code = if result["service"].is_object() && code == Some("timeout") {
+                None
+            } else {
+                code
+            };
             result["outcome"] =
                 serde_json::json!(if code.is_some() { "blocked" } else { "failed" });
             result["reason"] = serde_json::json!(reason);
@@ -649,7 +688,18 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             }
         }
     };
-    let os = Command::new("/usr/bin/uname").arg("-v").output().ok();
+    let uname = |flag: &str| {
+        let mut c = Command::new("/usr/bin/uname");
+        c.arg(flag)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        crate::release::util::output_bounded(&mut c, None, std::time::Duration::from_secs(20))
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let os = uname("-v");
+    result["host"]["hostname_sha256"] =
+        serde_json::json!(uname("-n").map(|o| crate::release::util::sha256(&o.stdout)));
     result["host"]["os_build"] =
         serde_json::json!(os.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()));
     result["finished"] = serde_json::json!(chrono::Utc::now());
@@ -681,6 +731,8 @@ fn capability_contract(
         "docker-sbx",
         "sbx-test-identity",
         "public-network",
+        "apple-containers",
+        "docker",
     ]
     .into_iter()
     .filter(|cap| {
@@ -695,8 +747,11 @@ fn capability_contract(
 }
 fn enforce_cleanup(cleaned: Result<bool>, swept: Result<()>) -> Result<()> {
     let leaked =
-        cleaned.map_err(|e| anyhow::anyhow!("SBX cleanup unverified; result void: {e:#}"))?;
-    ensure!(!leaked, "owned SBX sandbox survived its test; result void");
+        cleaned.map_err(|e| anyhow::anyhow!("runtime cleanup unverified; result void: {e:#}"))?;
+    ensure!(
+        !leaked,
+        "owned runtime object survived its test; result void"
+    );
     swept.map_err(|e| anyhow::anyhow!("owned-process cleanup failed; result void: {e:#}"))
 }
 
@@ -712,6 +767,8 @@ fn blocked_reason(sbx: bool, error: &anyhow::Error) -> Option<&'static str> {
         "sbx-network",
     ];
     let legacy = [
+        "apple-service-unavailable",
+        "docker-daemon-unavailable",
         "no-hypervisor",
         "fixture-digest",
         "socket-budget",
@@ -882,5 +939,564 @@ mod tests {
         assert!(args.contains("--target-dir-remap"));
         assert!(args.contains("--user-config-file none"));
         assert!(!args.contains("--archive-file"));
+    }
+}
+
+/// Bounded service commands, separate from nextest's private HOME. No credentials
+/// or arbitrary inherited variables are copied into this process environment.
+struct RuntimeService {
+    cli: PathBuf,
+    runtime: &'static str,
+    engine: Option<String>,
+}
+fn runtime_cli(name: &str) -> Result<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|p| p.join(name))
+        .find(|p| p.is_file())
+        .context("runtime CLI missing")?
+        .canonicalize()
+        .map_err(Into::into)
+}
+impl RuntimeService {
+    fn probe(id: &str) -> Result<Option<Self>> {
+        use crate::manifest::release_policy::{APPLE_NATIVE, DOCKER_NATIVE};
+        let (name, runtime, prefix) = match id {
+            APPLE_NATIVE => ("container", "apple", "apple-service-unavailable"),
+            DOCKER_NATIVE => ("docker", "docker", "docker-daemon-unavailable"),
+            _ => return Ok(None),
+        };
+        let cli = runtime_cli(name)
+            .with_context(|| format!("{prefix}: {name} CLI missing or unreadable"))?;
+        let service = Self {
+            cli,
+            runtime,
+            engine: (runtime == "docker").then(|| {
+                std::env::var("DOCKER_HOST")
+                    .unwrap_or_else(|_| "unix:///var/run/docker.sock".into())
+            }),
+        };
+        service
+            .identity()
+            .map_err(|e| anyhow::anyhow!("{prefix}: {e:#}"))?;
+        Ok(Some(service))
+    }
+    fn identity(&self) -> Result<serde_json::Value> {
+        let (version, server) = runtime_owned::versions(self.runtime, self)?;
+        let mut value = serde_json::json!({"kind": if self.runtime == "apple" {"apple-containers"} else {"docker"},
+            "cli_path":self.cli,"cli_sha256":digest::sha256_file(&self.cli)?,"cli_version":version});
+        if let Some(engine) = &self.engine {
+            value["server_version"] = server.into();
+            value["engine"] = engine.clone().into();
+        } else {
+            value["service_version"] = server.into();
+        }
+        Ok(value)
+    }
+}
+impl Service for RuntimeService {
+    fn output(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let stdout = tempfile::tempfile()?;
+        let stderr = tempfile::tempfile()?;
+        let mut c = Command::new(&self.cli);
+        c.args(args)
+            .env_clear()
+            .stdout(stdout.try_clone()?)
+            .stderr(stderr.try_clone()?);
+        for name in [
+            "HOME",
+            "PATH",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "SystemRoot",
+            "DOCKER_TLS_VERIFY",
+            "DOCKER_CERT_PATH",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                c.env(name, value);
+            }
+        }
+        if let Some(engine) = &self.engine {
+            c.env("DOCKER_HOST", engine);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
+        let mut child = c.spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                #[cfg(unix)]
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("runtime service command deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // Never store CLI stderr: it may contain endpoint or login diagnostics.
+        ensure!(status.success(), "runtime service command failed: {args:?}");
+        use std::io::{Read, Seek};
+        let mut stdout = stdout;
+        stdout.rewind()?;
+        ensure!(
+            stdout.metadata()?.len() <= 8 * 1024 * 1024,
+            "oversized runtime inventory"
+        );
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+fn reserve_runtime(
+    out: &Path,
+    tmproot: &Path,
+    service: &RuntimeService,
+    budget: u64,
+) -> Result<()> {
+    ensure!(
+        !out.join("runtime-owned.json").exists(),
+        "runtime reservation already exists; reconcile allocation before reuse"
+    );
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("runtime owner randomness: {e}"))?;
+    let token: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let owner = format!("awr-{token}");
+    runtime_owned::Reservation {
+        schema: 1,
+        runtime: service.runtime.into(),
+        project: format!("awsmoke-{token}"),
+        image_tag: format!("awman-smoke/guest:{owner}"),
+        label: format!("awman.release.smoke.owner={owner}"),
+        owner,
+        cli_path: service.cli.clone(),
+        cli_sha256: digest::sha256_file(&service.cli)?,
+        engine: service.engine.clone(),
+        root: tmproot.canonicalize()?,
+        deadline: (chrono::Utc::now() + chrono::Duration::seconds(budget.try_into()?)).to_rfc3339(),
+        armed: false,
+    }
+    .write(out)
+}
+fn reconcile_runtime(out: &Path, tmproot: &Path, cli: &RuntimeService) -> Result<bool> {
+    let r = runtime_owned::Reservation::read(out, tmproot)?;
+    ensure!(
+        r.runtime == cli.runtime,
+        "reservation runtime differs from kit"
+    );
+    runtime_owned::reconcile(&r, cli, out)
+}
+
+fn reserved_runtime_service(native: &str, out: &Path, tmproot: &Path) -> Result<RuntimeService> {
+    let name = match native {
+        crate::manifest::release_policy::APPLE_NATIVE => "container",
+        crate::manifest::release_policy::DOCKER_NATIVE => "docker",
+        _ => anyhow::bail!("kit has no owned runtime"),
+    };
+    // An output document must never choose a host executable. Resolve only
+    // the known runtime program, then compare its pinned identity before use.
+    validate_reserved_runtime_service(native, out, tmproot, &runtime_cli(name)?)
+}
+fn validate_reserved_runtime_service(
+    native: &str,
+    out: &Path,
+    tmproot: &Path,
+    cli: &Path,
+) -> Result<RuntimeService> {
+    let r = runtime_owned::Reservation::read(out, tmproot)?;
+    let expected = match native {
+        crate::manifest::release_policy::APPLE_NATIVE => "apple",
+        crate::manifest::release_policy::DOCKER_NATIVE => "docker",
+        _ => anyhow::bail!("kit has no owned runtime"),
+    };
+    ensure!(
+        r.runtime == expected
+            && cli.canonicalize()? == r.cli_path
+            && digest::sha256_file(cli)? == r.cli_sha256,
+        "reserved service CLI changed; cleanup unverified"
+    );
+    Ok(RuntimeService {
+        cli: cli.canonicalize()?,
+        runtime: expected,
+        engine: r.engine,
+    })
+}
+
+#[derive(Parser)]
+struct ReconcileArgs {
+    #[arg(long)]
+    kit: PathBuf,
+    #[arg(long)]
+    out: PathBuf,
+    #[arg(long)]
+    tmproot: PathBuf,
+}
+/// Dispatch from `test.rs`: `Some("kit-reconcile") => kit::reconcile(&args[1..])`.
+pub(super) fn reconcile(args: &[String]) -> Result<ExitCode> {
+    let a = ReconcileArgs::try_parse_from(
+        std::iter::once("kit-reconcile".to_owned()).chain(args.iter().cloned()),
+    )?;
+    if !a.out.join("runtime-owned.json").exists() {
+        println!("leaked=0");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let kit: Kit = serde_json::from_slice(&std::fs::read(a.kit.join("kit.json"))?)?;
+    let service = reserved_runtime_service(&kit.native_id, &a.out, &a.tmproot)?;
+    match reconcile_runtime(&a.out, &a.tmproot, &service) {
+        Ok(_) => {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(a.out.join("runtime-reconcile.json"))?)?;
+            println!(
+                "leaked={}",
+                receipt["leaked"]
+                    .as_u64()
+                    .context("missing cleanup leak count")?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            eprintln!("runtime reconciliation failed: {e:#}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+    #[test]
+    fn runtime_contracts_grant_only_their_service_and_cleanup_overrides_blocking() {
+        use crate::manifest::release_policy::{APPLE_NATIVE, DOCKER_NATIVE};
+        let m = crate::manifest::load(&crate::gates::root()).unwrap();
+        for (id, cap) in [
+            (APPLE_NATIVE, "apple-containers"),
+            (DOCKER_NATIVE, "docker"),
+        ] {
+            let contract = capability_contract(&m, &m.release.native[id]);
+            assert_eq!(contract["grants"], serde_json::json!([cap]));
+            assert!(contract["offline_enforced"].is_null());
+        }
+        for code in ["apple-service-unavailable", "docker-daemon-unavailable"] {
+            assert_eq!(
+                blocked_reason(false, &anyhow::anyhow!("{code}: absent")),
+                Some(code)
+            );
+        }
+        for error in [
+            anyhow::anyhow!("native tests failed"),
+            anyhow::anyhow!("service CLI changed during the check"),
+            enforce_cleanup(Ok(true), Ok(())).unwrap_err(),
+            enforce_cleanup(Err(anyhow::anyhow!("unreadable listing")), Ok(())).unwrap_err(),
+        ] {
+            assert_eq!(blocked_reason(false, &error), None);
+        }
+    }
+    struct FakeService<'a> {
+        s: &'a TestSandbox,
+        exe: PathBuf,
+    }
+    impl Service for FakeService<'_> {
+        fn output(&self, args: &[&str]) -> Result<Vec<u8>> {
+            let o = self.s.command(&self.exe).args(args).run();
+            ensure!(o.exit.success(), "fake service failed");
+            Ok(o.stdout)
+        }
+    }
+    #[cfg(unix)]
+    fn fake(s: &mut TestSandbox, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = s.bin().join("runtime-service");
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        s.register_exe("runtime-service", &path);
+        path
+    }
+    fn reservation(s: &TestSandbox, runtime: &str) -> runtime_owned::Reservation {
+        let owner = "awr-0123456789abcdef";
+        let cli = s.work().join("reserved-cli");
+        std::fs::write(&cli, "private service identity").unwrap();
+        runtime_owned::Reservation {
+            schema: 1,
+            runtime: runtime.into(),
+            owner: owner.into(),
+            cli_path: cli,
+            cli_sha256: digest::sha256(b"private service identity"),
+            engine: (runtime == "docker").then(|| "unix:///private-test/docker.sock".into()),
+            project: "awsmoke-0123456789abcdef".into(),
+            image_tag: format!("awman-smoke/guest:{owner}"),
+            label: format!("awman.release.smoke.owner={owner}"),
+            root: s.root().canonicalize().unwrap(),
+            deadline: chrono::Utc::now().to_rfc3339(),
+            armed: true,
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn fake_docker_reconciliation_removes_only_reserved_objects_and_records_the_leak() {
+        let mut s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::fake_docker_reconciliation_removes_only_reserved_objects_and_records_the_leak"));
+        let exe = fake(
+            &mut s,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'ps --all')
+ echo '{"ID":"peer","Image":"user-project:latest"}'
+ test -f gone-container || echo '{"ID":"owned","Image":"awman-awsmoke-0123456789abcdef-claude:latest"}' ;;
+'image ls') test -f gone-image || echo '{"Repository":"awman-smoke/guest","Tag":"awr-0123456789abcdef"}' ;;
+'rm --force') test "$3" = owned || exit 4; touch gone-container ;;
+'image rm') test "$3" = awman-smoke/guest:awr-0123456789abcdef || exit 5; touch gone-image ;;
+*) exit 8 ;;
+esac
+exit 0
+"#,
+        );
+        let r = reservation(&s, "docker");
+        r.write(&s.work()).unwrap();
+        let cli = FakeService { s: &s, exe };
+        assert!(runtime_owned::reconcile(&r, &cli, &s.work()).unwrap());
+        assert!(!runtime_owned::reconcile(&r, &cli, &s.work()).unwrap());
+        assert_eq!(runtime_owned::inventory(&r, &cli).unwrap().len(), 0);
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(s.work().join("runtime-reconcile.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["leaked"], 0);
+        assert_eq!(record["verified"], true);
+        drop(cli);
+        s.finish();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_removal_command_is_not_erased_by_an_empty_followup_inventory() {
+        let mut s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::failed_removal_command_is_not_erased_by_an_empty_followup_inventory"));
+        let exe = fake(
+            &mut s,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+case "$1 $2" in
+'ps --all') test -f present || exit 0; echo '{"ID":"owned","Image":"awman-awsmoke-0123456789abcdef-claude:latest"}' ;;
+'image ls') ;;
+'rm --force') rm -f present; exit 17 ;;
+'image rm') ;;
+*) exit 8 ;;
+esac
+"#,
+        );
+        std::fs::write(s.bin().join("present"), b"owned").unwrap();
+        let r = reservation(&s, "docker");
+        r.write(&s.work()).unwrap();
+        let cli = FakeService { s: &s, exe };
+        assert!(runtime_owned::reconcile(&r, &cli, &s.work()).is_err());
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(s.work().join("runtime-reconcile.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["remaining"], 0);
+        assert_eq!(record["verified"], false);
+        assert_eq!(record["removal_errors"].as_array().unwrap().len(), 1);
+        s.finish();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn unarmed_occupied_names_and_unreadable_listings_never_authorize_removal() {
+        let mut s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::unarmed_occupied_names_and_unreadable_listings_never_authorize_removal"));
+        let exe = fake(
+            &mut s,
+            r#"#!/bin/sh
+case "$1 $2" in
+'list --all') echo '[{"configuration":{"id":"owned","image":{"reference":"awman-awsmoke-0123456789abcdef-claude:latest"}}}]' ;;
+'image list') echo '[]' ;;
+*) exit 9 ;;
+esac
+"#,
+        );
+        let mut r = reservation(&s, "apple");
+        r.armed = false;
+        let cli = FakeService {
+            s: &s,
+            exe: exe.clone(),
+        };
+        assert!(!runtime_owned::reconcile(&r, &cli, &s.work()).unwrap());
+        assert_eq!(
+            runtime_owned::inventory(&r, &cli).unwrap().len(),
+            1,
+            "the pre-existing container must be preserved"
+        );
+        drop(cli);
+        let exe = fake(&mut s, "#!/bin/sh\necho invalid-json\n");
+        let cli = FakeService { s: &s, exe };
+        assert!(runtime_owned::reconcile(&r, &cli, &s.work()).is_err());
+        drop(cli);
+        s.finish();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn fake_service_probe_requires_a_server_and_versions_never_count_as_a_session() {
+        let mut s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::fake_service_probe_requires_a_server_and_versions_never_count_as_a_session"));
+        let exe = fake(
+            &mut s,
+            r#"#!/bin/sh
+case "$1 $2" in
+'--version ') echo 'container 0.12.0' ;;
+'system status') echo 'apiserver is running' ;;
+'system version') echo '{"appName":"container CLI","version":"0.12.0","server":{"version":"0.12.0"}}' ;;
+'version --format') echo '28.0.0' ;;
+*) exit 9 ;;
+esac
+"#,
+        );
+        let cli = FakeService { s: &s, exe };
+        assert_eq!(runtime_owned::versions("apple", &cli).unwrap().1, "0.12.0");
+        assert_eq!(runtime_owned::versions("docker", &cli).unwrap().1, "28.0.0");
+        let rows = r#"[{"appName":"container","version":"0.12.0"},{"appName":"container-apiserver","version":"0.13.0"}]"#;
+        let script = format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo container; elif [ \"$2\" = version ]; then echo '{rows}'; elif [ \"$2\" = status ]; then exit 0; else exit 9; fi\n");
+        std::fs::write(&cli.exe, script).unwrap();
+        assert_eq!(runtime_owned::versions("apple", &cli).unwrap().1, "0.13.0");
+        // Read-only probes cannot produce an attested session or clean inventory.
+        assert!(!s.work().join("runtime-smoke.json").exists());
+        assert!(runtime_owned::inventory(&reservation(&s, "docker"), &cli).is_err());
+        drop(cli);
+        let exe = fake(
+            &mut s,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo client-only; exit 0; fi\nexit 1\n",
+        );
+        let cli = FakeService { s: &s, exe };
+        for runtime in ["apple", "docker"] {
+            assert!(runtime_owned::versions(runtime, &cli).is_err());
+        }
+        drop(cli);
+        s.finish();
+    }
+    #[test]
+    fn local_archive_conversion_preserves_every_pinned_blob_and_owns_only_the_new_tag() {
+        use awman_test_support::fixtures::OciImageBuilder;
+        use std::io::Read;
+        fn members(path: &Path) -> BTreeMap<String, Vec<u8>> {
+            tar::Archive::new(std::fs::File::open(path).unwrap())
+                .entries()
+                .unwrap()
+                .map(|e| {
+                    let mut e = e.unwrap();
+                    let path = e.path().unwrap().to_string_lossy().into_owned();
+                    let mut bytes = Vec::new();
+                    e.read_to_end(&mut bytes).unwrap();
+                    (path, bytes)
+                })
+                .collect()
+        }
+        let s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::local_archive_conversion_preserves_every_pinned_blob_and_owns_only_the_new_tag"));
+        let source = s.work().join("pinned.tar");
+        OciImageBuilder::new()
+            .ref_name("awman-test/guest:fixture")
+            .layer(&[("etc/proof", b"pinned")])
+            .build()
+            .write_archive(&source);
+        let original = digest::sha256_file(&source).unwrap();
+        let before = members(&source);
+        let tag = "awman-smoke/guest:awr-0123456789abcdef";
+        for docker in [false, true] {
+            let target = s.work().join("private.tar");
+            runtime_owned::private_archive(&source, &target, tag, docker).unwrap();
+            let after = members(&target);
+            for (path, bytes) in &before {
+                if path.starts_with("blobs/") {
+                    assert_eq!(after.get(path), Some(bytes));
+                }
+            }
+            if docker {
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(&after["manifest.json"]).unwrap();
+                assert_eq!(manifest[0]["RepoTags"], serde_json::json!([tag]));
+                assert!(after.contains_key(manifest[0]["Config"].as_str().unwrap()));
+                for layer in manifest[0]["Layers"].as_array().unwrap() {
+                    assert!(after.contains_key(layer.as_str().unwrap()));
+                }
+                assert!(!after.contains_key("index.json"));
+            } else {
+                let index: serde_json::Value =
+                    serde_json::from_slice(&after["index.json"]).unwrap();
+                assert_eq!(
+                    index["manifests"][0]["annotations"]["org.opencontainers.image.ref.name"],
+                    tag
+                );
+            }
+            assert_eq!(digest::sha256_file(&source).unwrap(), original);
+        }
+        s.finish();
+    }
+    #[test]
+    fn recovery_uses_the_reserved_engine_and_rejects_changed_cli_bytes() {
+        let s = TestSandbox::for_test(TestCase::component("test::kit::runtime_tests::recovery_uses_the_reserved_engine_and_rejects_changed_cli_bytes"));
+        let r = reservation(&s, "docker");
+        r.write(&s.work()).unwrap();
+        let recovered = validate_reserved_runtime_service(
+            crate::manifest::release_policy::DOCKER_NATIVE,
+            &s.work(),
+            s.root(),
+            &r.cli_path,
+        )
+        .unwrap();
+        assert_eq!(recovered.engine, r.engine);
+        assert_eq!(recovered.cli, r.cli_path);
+        let other_cli = s.work().join("other-cli");
+        std::fs::write(&other_cli, "private service identity").unwrap();
+        assert!(
+            validate_reserved_runtime_service(
+                crate::manifest::release_policy::DOCKER_NATIVE,
+                &s.work(),
+                s.root(),
+                &other_cli
+            )
+            .is_err(),
+            "a reservation cannot redirect the resolved runtime executable"
+        );
+        assert!(validate_reserved_runtime_service(
+            crate::manifest::release_policy::APPLE_NATIVE,
+            &s.work(),
+            s.root(),
+            &r.cli_path
+        )
+        .is_err());
+        std::fs::write(&r.cli_path, "replacement executable").unwrap();
+        assert!(validate_reserved_runtime_service(
+            crate::manifest::release_policy::DOCKER_NATIVE,
+            &s.work(),
+            s.root(),
+            &r.cli_path
+        )
+        .is_err());
+        s.finish();
+    }
+    #[test]
+    fn reservation_rejects_foreign_roots_tags_and_projects() {
+        let s = TestSandbox::for_test(TestCase::component(
+            "test::kit::runtime_tests::reservation_rejects_foreign_roots_tags_and_projects",
+        ));
+        let r = reservation(&s, "docker");
+        r.write(&s.work()).unwrap();
+        runtime_owned::Reservation::read(&s.work(), s.root()).unwrap();
+        for field in 0..6 {
+            let mut bad = r.clone();
+            match field {
+                0 => bad.root = s.work(),
+                1 => bad.image_tag = "user-image:latest".into(),
+                2 => bad.project = "user-project".into(),
+                3 => bad.engine = None,
+                4 => bad.cli_path = PathBuf::from("relative-cli"),
+                _ => bad.cli_sha256 = "invalid".into(),
+            }
+            bad.write(&s.work()).unwrap();
+            assert!(runtime_owned::Reservation::read(&s.work(), s.root()).is_err());
+        }
+        s.finish();
     }
 }

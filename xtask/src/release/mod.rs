@@ -23,6 +23,7 @@ mod preflight;
 mod produce;
 mod rehearse;
 pub mod run;
+pub(crate) mod runtime_smoke;
 pub(crate) mod sbx;
 mod status;
 pub mod util;

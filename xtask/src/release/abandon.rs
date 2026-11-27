@@ -30,6 +30,7 @@ pub fn abandon(w: &World, dir: &Path) -> Step {
             ),
         ));
     }
+    super::runtime_smoke::cleanup_attempt(w, &store, &j)?;
     let marker = draft_marker(&j.operation);
     for r in w.forge.releases()? {
         if r.draft && r.body.contains(&marker) {

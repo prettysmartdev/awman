@@ -159,6 +159,11 @@ pub fn output_bounded(
     if input.is_some() {
         cmd.stdin(Stdio::piped());
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn()?;
     if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
         let bytes = bytes.to_vec();
@@ -193,6 +198,11 @@ pub fn output_bounded(
             break status;
         }
         if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child.id() as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
             let _ = child.kill();
             let _ = child.wait();
             return Err(std::io::Error::new(

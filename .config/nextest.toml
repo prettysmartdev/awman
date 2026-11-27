@@ -18,10 +18,24 @@ max-threads = 4
 [test-groups.vm]
 max-threads = 2
 
+# artifact-apple-smoke
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=artifact) & (test(=apple_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container))"
+slow-timeout = { period = "1s", terminate-after = 420 }
+test-group = "apple"
+threads-required = "num-test-threads"
+
 # artifact-deps-scan
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=artifact) & (test(/^deps_scan::/))"
 slow-timeout = { period = "1s", terminate-after = 300 }
+
+# artifact-docker-smoke
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=artifact) & (test(=docker_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container))"
+slow-timeout = { period = "1s", terminate-after = 420 }
+test-group = "docker"
+threads-required = "num-test-threads"
 
 # artifact-entrypoints
 [[profile.default.overrides]]

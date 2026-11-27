@@ -2,6 +2,8 @@
 use super::*;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 const SCRIPT: &str = include_str!("linux.sh");
 
@@ -10,6 +12,15 @@ const SCRIPT: &str = include_str!("linux.sh");
 fn forward_progress(
     reader: &mut impl BufRead,
     pending: &mut Vec<u8>,
+    emit: impl FnMut(&str),
+) -> Result<()> {
+    forward_progress_with(reader, pending, "validate-sbx-linux: ", emit)
+}
+
+pub(super) fn forward_progress_with(
+    reader: &mut impl BufRead,
+    pending: &mut Vec<u8>,
+    prefix: &str,
     mut emit: impl FnMut(&str),
 ) -> Result<()> {
     loop {
@@ -19,7 +30,7 @@ fn forward_progress(
         if pending.ends_with(b"\n") {
             let line = String::from_utf8_lossy(pending);
             let line = line.trim_end_matches(['\r', '\n']);
-            if line.starts_with("validate-sbx-linux: ") {
+            if line.starts_with(prefix) {
                 emit(line);
             }
             pending.clear();
@@ -38,7 +49,34 @@ fn ssh_command(destination: &str, name: &str, nonce: &str) -> Result<Command> {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')),
         "invalid remote smoke arguments"
     );
-    let mut command = Command::new("ssh");
+    ssh_command_with(
+        Path::new("ssh"),
+        destination,
+        &["sh", "-s", "--", name, nonce],
+    )
+}
+
+/// `program -T <fixed options> <destination> <remote...>`. ssh joins the
+/// remote words with spaces for the remote shell, so every word is limited to
+/// characters with no shell meaning (plus a lone `>` redirection).
+pub(super) fn ssh_command_with(
+    program: &Path,
+    destination: &str,
+    remote: &[&str],
+) -> Result<Command> {
+    ensure!(
+        crate::release::util::valid_ssh_destination(destination),
+        "invalid LINUX_HOST"
+    );
+    ensure!(
+        !remote.is_empty()
+            && remote.iter().all(|s| *s == ">"
+                || (!s.is_empty()
+                    && s.bytes().all(|b| b.is_ascii_alphanumeric()
+                        || matches!(b, b'/' | b'.' | b'_' | b'-' | b'=')))),
+        "invalid remote smoke arguments"
+    );
+    let mut command = Command::new(program);
     command.args([
         "-T",
         "-o",
@@ -50,12 +88,8 @@ fn ssh_command(destination: &str, name: &str, nonce: &str) -> Result<Command> {
         "-o",
         "ClearAllForwardings=yes",
         destination,
-        "sh",
-        "-s",
-        "--",
-        name,
-        nonce,
     ]);
+    command.args(remote);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

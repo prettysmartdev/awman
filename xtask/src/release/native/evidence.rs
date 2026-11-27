@@ -72,6 +72,14 @@ pub(super) fn verify(job: &NativeJob, path: &Path) -> Step {
         if job.plan.id == crate::manifest::release_policy::SBX_NATIVE {
             super::super::sbx::verify(out, &r["sbx"])?;
         }
+        if [
+            crate::manifest::release_policy::APPLE_NATIVE,
+            crate::manifest::release_policy::DOCKER_NATIVE,
+        ]
+        .contains(&job.plan.id.as_str())
+        {
+            runtime(job, out, &r)?;
+        }
         let expected: Value = read_json(&out.join("expected.json"))?;
         let inventory = crate::evidence::actions::expected(&expected)?;
         let want: BTreeSet<_> = job.plan.tests.iter().cloned().collect();
@@ -112,7 +120,9 @@ pub(super) fn verify(job: &NativeJob, path: &Path) -> Step {
             )?)
         };
         ensure!(
-            time("started")? <= time("finished")?,
+            time("started")? <= time("finished")?
+                && (time("finished")? - time("started")?).num_seconds()
+                    <= job.plan.budget_seconds as i64,
             "native timestamps are reversed"
         );
         let (os, arch) = if job.plan.triple.contains("apple") {
@@ -131,6 +141,140 @@ pub(super) fn verify(job: &NativeJob, path: &Path) -> Step {
         Ok(())
     };
     checked().map_err(|e| Stop::new("native-result-invalid", format!("{}: {e:#}", job.plan.id)))
+}
+
+/// Verify the production runtime journey and owned cleanup, in addition to JUnit.
+fn runtime(job: &NativeJob, out: &Path, r: &Value) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    let apple = job.plan.id == crate::manifest::release_policy::APPLE_NATIVE;
+    let kind = if apple { "apple" } else { "docker" };
+    let service = &r["service"];
+    ensure!(
+        r["host"]["hostname_sha256"]
+            .as_str()
+            .is_some_and(crate::release::util::is_sha256),
+        "missing runtime host identity"
+    );
+    let caps: Value = read_json(&job.kit_dir.join("capabilities.json"))?;
+    ensure!(
+        caps["grants"]
+            == serde_json::json!(crate::manifest::release_policy::native_grants(
+                &job.plan.id
+            )?),
+        "wrong native service grants"
+    );
+    ensure!(
+        service["kind"] == if apple { "apple-containers" } else { "docker" },
+        "wrong runtime service"
+    );
+    for key in [
+        "cli_path",
+        "cli_version",
+        if apple {
+            "service_version"
+        } else {
+            "server_version"
+        },
+    ] {
+        ensure!(
+            service[key].as_str().is_some_and(|s| !s.is_empty()),
+            "missing service identity {key}"
+        );
+    }
+    ensure!(
+        service["cli_sha256"]
+            .as_str()
+            .is_some_and(crate::release::util::is_sha256),
+        "invalid CLI digest"
+    );
+    for (name, key) in [
+        ("runtime-owned.json", "runtime_owned_sha256"),
+        ("runtime-reconcile.json", "runtime_reconcile_sha256"),
+        ("runtime-smoke.json", "runtime_smoke_sha256"),
+    ] {
+        ensure!(r[key] == sha256_file(&out.join(name))?, "unbound {name}");
+    }
+    let owned: Value = read_json(&out.join("runtime-owned.json"))?;
+    let audit: Value = read_json(&out.join("runtime-reconcile.json"))?;
+    let smoke: Value = read_json(&out.join("runtime-smoke.json"))?;
+    ensure!(
+        owned["schema"] == 1
+            && owned["armed"] == true
+            && owned["runtime"] == kind
+            && owned["cli_path"] == service["cli_path"]
+            && owned["cli_sha256"] == service["cli_sha256"]
+            && owned["engine"] == service["engine"],
+        "ownership/service binding differs"
+    );
+    let token = owned["owner"]
+        .as_str()
+        .and_then(|s| s.strip_prefix("awr-"))
+        .context("runtime owner")?;
+    ensure!(
+        token.len() == 16
+            && token
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "invalid runtime owner"
+    );
+    ensure!(
+        owned["project"] == format!("awsmoke-{token}"),
+        "project differs from reservation"
+    );
+    ensure!(
+        audit["schema"] == 1
+            && audit["owner"] == owned["owner"]
+            && audit["leaked"] == 0
+            && audit["remaining"] == 0
+            && audit["verified"] == true
+            && audit["removal_errors"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+        "cleanup incomplete or leaked objects"
+    );
+    ensure!(
+        smoke["schema"] == 1
+            && smoke["runtime"] == kind
+            && smoke["owner"] == owned["owner"]
+            && smoke["project"] == owned["project"]
+            && smoke["artifact_sha256"] == job.asset_sha256
+            && smoke["ready_exit"] == 0
+            && smoke["task_exit"] == 37
+            && smoke["guest_os"] == "Linux"
+            && smoke["prompt_observed"] == true
+            && smoke["stderr_observed"] == true
+            && smoke["removed"] == true
+            && smoke["verified_absent"] == true,
+        "incomplete runtime command/cleanup proof"
+    );
+    ensure!(
+        smoke["containers"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "no running container observed"
+    );
+    // These are paths on the admitted Unix host, not on the controller running
+    // the verifier (the fault world also runs in Windows CI).
+    let root = owned["root"].as_str().context("private runtime root")?;
+    ensure!(
+        root.starts_with('/')
+            && root.split('/').count() > 3
+            && !root.split('/').any(|c| c == ".." || c == "."),
+        "invalid private root"
+    );
+    let mounts = smoke["mount_sources"]
+        .as_array()
+        .context("missing mount audit")?;
+    ensure!(!mounts.is_empty(), "empty mount audit");
+    for mount in mounts {
+        let p = mount.as_str().context("mount source")?;
+        ensure!(
+            p.starts_with(&format!("{}/", root.trim_end_matches('/')))
+                && !p.split('/').any(|c| c == ".." || c == "."),
+            "mount outside private runtime root"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -221,5 +365,163 @@ mod tests {
         write_json(&path, &result).unwrap();
         std::fs::write(out.join("runner.log"), "tampered").unwrap();
         assert!(native::verify_result(&job, &path, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::release::{plan::Plan, util::write_json};
+    use awman_test_support::{TestCase, TestSandbox};
+    #[test]
+    fn runtime_pass_requires_bound_service_journey_mounts_and_cleanup() {
+        let s = TestSandbox::for_test(TestCase::component("release::native::evidence::runtime_tests::runtime_pass_requires_bound_service_journey_mounts_and_cleanup"));
+        let plan: Plan = serde_json::from_slice(include_bytes!(
+            "../../../tests/release_contract/fixtures/release-plan.json"
+        ))
+        .unwrap();
+        for id in [
+            crate::manifest::release_policy::APPLE_NATIVE,
+            crate::manifest::release_policy::DOCKER_NATIVE,
+        ] {
+            let out = s.work().join(id);
+            std::fs::create_dir_all(&out).unwrap();
+            write_json(&out.join("capabilities.json"), &serde_json::json!({"grants":crate::manifest::release_policy::native_grants(id).unwrap()})).unwrap();
+            let job = NativeJob {
+                plan: plan.native(id).unwrap().clone(),
+                commit: "R".into(),
+                tree: "T".into(),
+                asset: out.join("asset"),
+                asset_sha256: "a".repeat(64),
+                kit_tar: out.join("kit.tar"),
+                kit_sha256: "b".repeat(64),
+                manifest_sha256: plan.manifest_sha256.clone(),
+                plan_sha256: "c".repeat(64),
+                policy_sha256: plan.policy_sha256.clone(),
+                kit_dir: out.clone(),
+                downloads: vec![],
+                out_dir: out.clone(),
+                deadline_seconds: 780,
+            };
+            let mut good = serde_json::json!({});
+            crate::release::runtime_smoke::fake::native(&job, &mut good).unwrap();
+            runtime(&job, &out, &good).unwrap();
+            for (file, field, key, bad) in [
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "task_exit",
+                    serde_json::json!(0),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "artifact_sha256",
+                    serde_json::json!("stale"),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "mount_sources",
+                    serde_json::json!(["/workspace"]),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "containers",
+                    serde_json::json!([]),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "guest_os",
+                    serde_json::json!("Darwin"),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "prompt_observed",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "stderr_observed",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "removed",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "verified_absent",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "ready_exit",
+                    serde_json::json!(1),
+                ),
+                (
+                    "runtime-smoke.json",
+                    "runtime_smoke_sha256",
+                    "project",
+                    serde_json::json!("foreign"),
+                ),
+                (
+                    "runtime-reconcile.json",
+                    "runtime_reconcile_sha256",
+                    "leaked",
+                    serde_json::json!(1),
+                ),
+                (
+                    "runtime-reconcile.json",
+                    "runtime_reconcile_sha256",
+                    "verified",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-reconcile.json",
+                    "runtime_reconcile_sha256",
+                    "removal_errors",
+                    serde_json::json!(["docker rm returned 17"]),
+                ),
+                (
+                    "runtime-owned.json",
+                    "runtime_owned_sha256",
+                    "armed",
+                    serde_json::json!(false),
+                ),
+                (
+                    "runtime-owned.json",
+                    "runtime_owned_sha256",
+                    "cli_sha256",
+                    serde_json::json!("differing-cli"),
+                ),
+            ] {
+                let saved = std::fs::read(out.join(file)).unwrap();
+                let mut value: Value = serde_json::from_slice(&saved).unwrap();
+                value[key] = bad;
+                write_json(&out.join(file), &value).unwrap();
+                let mut forged = good.clone();
+                forged[field] = serde_json::json!(sha256_file(&out.join(file)).unwrap());
+                assert!(
+                    runtime(&job, &out, &forged).is_err(),
+                    "{id}: accepted forged {key}"
+                );
+                std::fs::write(out.join(file), saved).unwrap();
+            }
+            let mut bad = good.clone();
+            bad["runtime_owned_sha256"] = Value::Null;
+            assert!(runtime(&job, &out, &bad).is_err());
+            bad = good.clone();
+            bad["host"]["hostname_sha256"] = Value::Null;
+            assert!(runtime(&job, &out, &bad).is_err());
+        }
     }
 }

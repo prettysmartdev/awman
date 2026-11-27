@@ -18,7 +18,7 @@ removed; Git history is the historical record.
 | Frontends | CLI parsing/output, real API requests and event delivery, TUI key handling, rendering and session switching | `tests/component/frontend`, `src/frontend/tui/contracts.rs` |
 | Squad and worker | Refusal before resource allocation, task leases and epochs, duplicate events, queue ownership, authenticated transport, interrupted/idempotent Git publishing | `tests/component/squad`, `tests/component/worker`, WSP state model |
 | External boundaries | Docker, registry, Git transports, template builds, Apple image-store export/cache and sbx | `tests/boundary` |
-| Native guest and artifact | Boot/exec/import/network, persistent upgrade, builders/strategy, signed offline asset boot, dependency and byte-integrity checks | `tests/guest`, `tests/artifact`; the two release-required native checks run in `make release`, the rest in the operator-run native diagnostic |
+| Native guest and artifact | Boot/exec/import/network, persistent upgrade, builders/strategy, signed offline asset boot, dependency and byte-integrity checks | `tests/guest`, `tests/artifact`; the release-required native checks (boot, Apple Containers and Docker smokes) run in `make release`, the rest in the operator-run native diagnostic |
 | CI and release | Conservative selection, exact compiled inventory/results, authenticated Actions artifacts/jobs, verified release evidence, sealing and publication guards, resume and recovery, operator interaction | `xtask` unit, CI, pipeline and release contracts |
 
 The `nextgen` reconciliation also covers remote reconnects and parallel-slot
@@ -63,8 +63,15 @@ breadth, soak, Apple and Linux boundaries and Linux replacement and upgrade.
 Deleted: the duplicate main, candidate and promotion gates, the
 packet-review transport, and reproduction of the four shipping assets.
 
+WI 0094 added release blockers without moving any back: one exact-asset Apple
+Containers session (`native.macos-arm64-apple`), one exact-asset Docker session
+(`native.linux-x64-docker`) and the lightweight SBX smoke on the selected hosts.
+They are narrower than, and do not replace, the Apple, Docker and `sbx` boundary
+suites or the optional provider smoke.
+
 The native evidence remains operator evidence. Real macOS HVF boot and upgrade,
-Linux KVM over SSH, the Windows firewall, and complete publication timing are
+Linux KVM over SSH, the Apple Containers, Docker and SBX services, the Windows
+firewall, and complete publication timing are
 verified by rehearsal on real hosts and recorded in
 [release-measurements.md](release-measurements.md); hosted compilation, a Linux
 run or local fake-host tests do not stand in for them. Native breadth has no

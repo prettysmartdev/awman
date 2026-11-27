@@ -102,11 +102,19 @@ comma-separated list: `docker=unix:///var/run/docker.sock,git-transports`.
 Unset means none, so a bare `cargo test` can never touch a real engine, boot a
 guest or reach the network.
 
-**The dedicated SBX identity.** The full provider boundary and release-smoke
-suites require the `sbx-test-identity` capability, never a developer's own
-login. The separate experimental developer diagnostic `make validate-sbx`
-uses the existing logged-in session and runs no provider tasks. The full
-suites need three operator inputs: `AWMAN_TEST_SBX_HOME` (an owned, 0700
+**Artifact-tier service grants.** The artifact tier allows `docker` and
+`apple-containers` for exactly one suite each, `artifact-docker-smoke` and
+`artifact-apple-smoke`; the manifest policy rejects either capability on any
+other artifact suite. A release native kit grants only what its suite requires
+(`docker` or `apple-containers`, no hypervisor or offline grant); the pinned
+guest fixtures are validated kit inputs. See
+[Required release checks](#required-release-checks).
+
+**The dedicated SBX identity.** The full provider boundary suite and the
+provider artifact smoke require the `sbx-test-identity` capability, never a
+developer's own login. The developer diagnostic `make validate-sbx` and the
+[release SBX smoke](#required-release-checks) instead use the host's existing
+logged-in session and run no provider tasks. The full provider suites need three operator inputs: `AWMAN_TEST_SBX_HOME` (an owned, 0700
 directory used as `HOME`), `AWMAN_TEST_SBX_IDENTITY` (a non-secret account
 label) and `AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE` (an owned, 0600 file). Granting
 it sets only `HOME` for the child; `AWMAN_HOME`, XDG and Git configuration stay
@@ -117,7 +125,8 @@ qualify the Codex and Copilot routes; Cline and Antigravity need a credential
 approved in the identity. A route without its credential is BLOCKED.
 
 **BLOCKED versus FAILED.** A missing capability, a host that is not Apple
-silicon macOS, an `sbx` older than 0.54.0 (boundary) or 0.53.0 (release smoke),
+silicon macOS, an `sbx` older than 0.54.0 (boundary) or 0.53.0 (provider
+artifact smoke),
 a signed-out identity or an unprovisioned provider credential reports
 `BLOCKED[...]` and is never a pass. A wrong product behavior, a failed or
 skipped test, or a surviving owned sandbox is FAILED. Both the `boundary-sbx`
@@ -342,7 +351,7 @@ A test's id is `<package>::<target> <module path>::<test name>`, for example
 | `tests/component/parity/` | `parity::builtin::`, `parity::daemon::`, `parity::differential::` | `component-parity-*` |
 | `tests/boundary/docker/`, `registry/`, `git/`, `apple/`, `sbx/`, `conformance/`, `templates/`, `soak/` | the directory name | `boundary-*`, `soak-*` |
 | `tests/guest/boot/`, `exec/`, `import/`, `network/`, `upgrade/`, `builder/`, `strategy/`, `soak/` | the directory name | `guest-*` |
-| `tests/artifact/entrypoints/`, `deps_scan/`, `signed_boot/`, `upgrade_policy/`, `smoke/`, `switches/`, `measure/` | the directory name | `artifact-*` |
+| `tests/artifact/entrypoints/`, `deps_scan/`, `signed_boot/`, `apple_smoke/`, `docker_smoke/`, `sbx_smoke/`, `upgrade_policy/`, `smoke/`, `switches/`, `measure/` | the directory name | `artifact-*` |
 | inline `#[cfg(test)]` in a crate | the crate's module path | `unit-<crate>` |
 
 Test function names describe the behaviour and its outcome
@@ -447,7 +456,7 @@ expires = "2026-12-31"
 
 ## Acceptance matrix
 
-`ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution. Native evidence comes from the release command's native checks or the native diagnostic.
+`ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution. Native evidence comes from the release command's checks on real hosts or the native diagnostic.
 
 The manifest runner accepts `--test-threads N` (a positive integer) to limit
 nextest parallelism without changing suite deadlines, retries or selection.
@@ -460,7 +469,7 @@ Tests own their private HOME, Git configuration, processes and sockets through T
 
 `--shuffle-seed` changes suite invocation order. It does not randomize tests inside a nextest invocation. Record repeats, time and failures accurately; a single clean run is not p95 or a long-term flake-rate measurement.
 
-The Actions controller authenticates service run, attempt, job roles and artifact digests, downloads evidence independently, and compares selected compiled tests with passing JUnit. Native results and diagnostic evidence directories are operator evidence and cannot authorize CI publication. The native checks below are separate from the hosted gates.
+The Actions controller authenticates service run, attempt, job roles and artifact digests, downloads evidence independently, and compares selected compiled tests with passing JUnit. Native results, SBX smoke records and diagnostic evidence directories are operator evidence and cannot authorize CI publication. The release checks below are separate from the hosted gates.
 
 ## Native validation
 
@@ -469,27 +478,63 @@ SBX smoke have different purposes.
 
 ### Required release checks
 
-`make release` runs exactly two native checks on the attested release bytes, on
-operator machines, through a prebuilt, digest-bound kit produced by the hosted
-`release.yml` build (a standalone `xtask`, the pinned nextest, the compiled
-artifact test target and its fake companion, and a compiled inventory):
+`make release` runs four native checks and the selected SBX smokes on the
+attested release bytes, on operator machines. The native checks use a prebuilt,
+digest-bound kit produced by the hosted `release.yml` build (a standalone
+`xtask`, the pinned nextest, the compiled artifact test target and its fake
+companion, and a compiled inventory):
 
-- macOS arm64 on the release Mac: signed offline boot and persisted-state
-  upgrade of `awman-macos-arm64`.
-- Linux x86_64 over SSH: offline KVM boot of `awman-linux-amd64` with the
-  architecture-matched amd64 fixture.
+| Check | Suite | Host and asset | Grants, fixture |
+|---|---|---|---|
+| `native.macos-arm64` | `artifact-signed-boot` | release Mac, `awman-macos-arm64`: signed offline boot and persisted-state upgrade | `hypervisor`, `offline`; `guest-oci-base` and the previous release |
+| `native.macos-arm64-apple` | `artifact-apple-smoke` | release Mac, `awman-macos-arm64` | `apple-containers`; `guest-oci-base` |
+| `native.linux-x64` | `artifact-linux-boot` | Linux x86_64 over SSH, `awman-linux-amd64`: offline KVM boot | `hypervisor`, `offline`; `guest-oci-base-amd64` |
+| `native.linux-x64-docker` | `artifact-docker-smoke` | Linux x86_64 over SSH, `awman-linux-amd64` | `docker`; `guest-oci-base-amd64` |
+
+`artifact-apple-smoke` and `artifact-docker-smoke` each hold one release-critical,
+non-overridable test,
+`exact_asset_runs_a_synthetic_session_in_an_owned_container` (module
+`apple_smoke` on macOS arm64, `docker_smoke` on Linux), with a 420-second suite
+budget inside a 480-second kit budget. Like `artifact-sbx-smoke`, they appear in
+no gate cell. The test loads the pinned guest fixture locally under a reserved
+tag (no registry pull), runs `awman ready --prepare-only --json` and one
+synthetic `exec prompt` session through the exact asset in private state,
+requires the guest output and exit 37, audits the running container's mounts and
+removes and verifies its objects. The kit reserves those names before the run,
+reconciles them independently afterwards (`cargo xtask test kit-reconcile`), and
+voids a result that leaked an object or cannot verify absence. Without its
+capability the test reports `BLOCKED[...]`, never a pass or skip.
 
 Nothing is compiled, signed or rebuilt on the native hosts, and the host has no
 Cargo or checkout. The runner verifies the kit's digests, runs with private
 HOME and Git configuration, deadlines and an exact expected inventory, enforces
-offline operation (seccomp on Linux, the macOS sandbox on the Mac), and writes
-`result.json`, JUnit and a runner log. The release command accepts a result only
-when the raw inventory, JUnit, log, command exit, environment contract, fixture
-and predecessor pins, source, tree, asset and kit digests all reconcile with the
-attested kit. A missing, short, skipped, blocked or failed result prevents
-sealing; there is no waiver. A pending fixture pin or missing capability is
-`BLOCKED`, never a pass. Results are operator evidence, not Actions
-attestations. See [release.md](release.md).
+offline operation for the two boot checks (seccomp on Linux, the macOS sandbox
+on the Mac), and writes `result.json`, JUnit and a runner log. The release
+command accepts a result only when the raw inventory, JUnit, log, command exit,
+environment contract, fixture and predecessor pins, source, tree, asset and kit
+digests all reconcile with the attested kit; the Apple and Docker results also
+need their bound service identity and ownership, session and cleanup documents.
+
+The SBX smoke is not a kit, a test suite or a capability. It is declared in
+`[release.sbx_smoke.*]` in `ci/gates.toml` (`sbx.macos-arm64` always,
+`sbx.linux-x64` only for an explicit `LINUX_HOST`) and implemented in
+`xtask/src/sbx_validation/release.rs`, sharing the shell-sandbox lifecycle with
+`make validate-sbx` and adding `awman ready --prepare-only` through the exact
+asset. It needs `sbx` 0.54.0 or newer. It proves no provider authentication,
+effective agent policy or successful provider task. The provider diagnostic
+`artifact-sbx-smoke` stays optional (`required = false`) and cannot satisfy it.
+
+A missing, short, skipped, blocked or failed result of any selected check
+prevents sealing; there is no waiver. A pending fixture pin, missing capability,
+unavailable service or signed-out CLI is `BLOCKED`, never a pass. Results are
+operator evidence, not Actions attestations. See [release.md](release.md).
+
+Test coverage of the release logic itself is hermetic: manifest policy, kit
+capability and cleanup handling, result verification and the SBX smoke (with
+fake `sbx`, `ssh` and `awman` executables, in suite `unit-xtask`), plus the
+fault-injected `make release-rehearse`. None of it is evidence that a real Apple
+Containers service, Docker Engine or SBX login works; only a run on the real
+hosts is.
 
 On macOS the runner allocates a short private root under `/private/tmp` and
 checks the canonical guest socket path against the 103-byte limit before
@@ -509,7 +554,8 @@ executable and architecture-specific fixtures, compiles the native suites,
 captures their expected tests, signs the guest executables on macOS and runs the
 guest, boundary, soak and artifact breadth (see the `native-diagnostic` gate in
 [cicd.md](cicd.md)). It never runs an agent on the host. This broad diagnostic excludes the SBX
-platform override; use `make validate-sbx` for Docker Sandboxes.
+platform override; use `make validate-sbx` for Docker Sandboxes. It does not
+run the release Apple, Docker or SBX smokes.
 
 It writes an evidence directory under `target/native-validation/`. Check one
 with `cargo xtask native-validation verify DIR` from a checkout of its exact
@@ -564,7 +610,9 @@ SSH agent forwarding is disabled. Remote failures fail the whole validation;
 an absent or unverifiable Linux result never counts as Linux evidence.
 
 This is a lightweight experimental-runtime diagnostic under grand architecture
-Tenet 4, outside the release critical path. It checks the CLI version and
+Tenet 4. The command itself is not a release gate; `make release` runs its own
+[release SBX smoke](#required-release-checks), which shares this lifecycle, and
+never consumes a diagnostic report. The diagnostic checks the CLI version and
 current session, creates a randomly named disposable shell sandbox, inspects it,
 checks Linux guest execution and workspace sharing through both exec and run,
 stops it, verifies exec can restart it, then removes it and verifies absence.
@@ -599,7 +647,7 @@ the tested platforms: Apple silicon macOS, plus the remote Linux architecture
 when `LINUX_HOST` was set and its smoke passed. No further provider tests,
 image-pinning exercise, credential provisioning or manual qualification are prerequisites for that
 enablement. The accepted Mac/Linux packet has enabled experimental SBX in
-shipping builds for macOS arm64 and Linux x86_64. The developer command adds no
-release gate and makes no automatic source edits. A cheap exact-asset entrypoint
+shipping builds for macOS arm64 and Linux x86_64. The developer command makes
+no automatic source edits. A cheap exact-asset entrypoint
 test verifies normal SBX agent admission without test isolation or provider
 credentials; deeper SBX provider smoke remains opt-in.

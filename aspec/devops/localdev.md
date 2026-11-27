@@ -166,10 +166,13 @@ fixtures and an owned loopback registry, runs the registered guest, boundary and
 artifact suites, and removes its registry even on failure. Missing prerequisites
 fail the run; they never count as passing skips.
 
-The release itself does not use this diagnostic. `make release` runs its two
-required native checks from a prebuilt kit, so the Linux KVM host needs only
-SSH, KVM, Git, the offline enforcement primitives and enough disk; no Rust
-toolchain, Docker, checkout or credentials. See [release.md](release.md).
+The release itself does not use this diagnostic or `make validate-sbx` reports.
+`make release` runs its required native checks from prebuilt kits and its own
+SBX smoke. The Linux host needs SSH, KVM, Git, a Docker Engine usable by that
+login, the offline enforcement primitives and enough disk, plus a signed-in
+`sbx` only when `LINUX_HOST` selects Linux SBX; no Rust toolchain, checkout or
+GitHub credential. The release Mac also needs the Apple Containers service and
+a signed-in `sbx`. See [release.md](release.md#prerequisites-the-prepared-environment).
 
 The first Linux release proves atomic executable replacement and cached restart.
 It does not claim migration from a previous Linux builtin release, because none

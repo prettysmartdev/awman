@@ -646,7 +646,8 @@ fn release_plan_freezes_assets_smoke_and_native_test_inventory() {
     assert_eq!(p["schema"], 1);
     assert_eq!(p["gate"], "release");
     assert_eq!(p["assets"].as_array().unwrap().len(), 4);
-    assert_eq!(p["native"].as_array().unwrap().len(), 2);
+    assert_eq!(p["native"].as_array().unwrap().len(), 4);
+    assert_eq!(p["sbx_smoke"].as_array().unwrap().len(), 2);
     for asset in p["assets"].as_array().unwrap() {
         assert_eq!(asset["builder"], "hosted");
         assert_eq!(

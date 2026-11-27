@@ -1,5 +1,7 @@
 //! Exact candidate bytes only. Never resolves CARGO_BIN_EXE_awman or runs Cargo.
 #![allow(dead_code)]
+pub mod runtime_owned;
+pub mod runtime_smoke;
 pub mod session;
 use awman_test_support::capability::{Offline, ReleaseArtifact};
 use awman_test_support::{Granted, Leak, OwnedCommand, TestCase, TestSandbox};
@@ -33,6 +35,12 @@ pub fn fake_cli_exe() -> &'static Path {
 pub struct ArtifactSandbox {
     sandbox: TestSandbox,
     _state: tempfile::TempDir,
+}
+impl ArtifactSandbox {
+    pub fn finish(self) {
+        // Keep private VM state alive until process and digest audits complete.
+        self.sandbox.finish();
+    }
 }
 impl std::ops::Deref for ArtifactSandbox {
     type Target = TestSandbox;

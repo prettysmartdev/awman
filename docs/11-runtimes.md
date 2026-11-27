@@ -690,6 +690,84 @@ Things that depend on the runtime and are reported honestly rather than assumed:
 - **First-byte grace versus automation startup.** Ordinary launches use a first-output grace period; automation launches instead use `agents.automation.startupTimeout`, and a slow runtime start (for example the Apple Containers start delay) does not trigger the ordinary grace-period kill.
 - **Credentials.** Replacing a credential inside a running agent or restarting an agent to apply one is not currently offered on any runtime.
 
+## Release smoke tests (maintainers)
+
+You can skip this section if you only use awman. It applies to maintainers
+publishing a release with `make release`, which tests the exact release binaries
+against real runtime services before anything is published. Every selected check
+must pass: a missing, blocked or failed one stops the release, and no other
+runtime is substituted.
+
+### Service prerequisites
+
+| Check | Host | What the host needs |
+|---|---|---|
+| Apple Containers | the Apple Silicon release Mac | The `container` CLI on `PATH` and its service running: `container system status` succeeds |
+| Docker | the Linux x86_64 release host, reached over SSH | A Docker Engine on that host. The SSH account runs `docker version` without a password, using `DOCKER_HOST` from its noninteractive environment or the default socket `/var/run/docker.sock`. A Docker context alone is not used |
+| Docker Sandboxes, always | the release Mac | `sbx` **0.54.0 or newer** on `PATH`, signed in (`sbx login`); `sbx ls --json` succeeds |
+| Docker Sandboxes, optional | the Linux release host | The same `sbx` version and sign-in for the SSH account, on its noninteractive `PATH`. Linux x86_64 only |
+
+The release version requirement for `sbx` is higher than the one for
+[using the runtime](#docker-sandboxes-experimental). The Linux host also needs
+KVM for the builtin boot check. `make release-doctor` probes these services
+without creating containers or sandboxes; the full prerequisite list is in the
+repository's [release runbook](../aspec/devops/release.md#prerequisites-the-prepared-environment).
+
+### Selecting Linux Docker Sandboxes
+
+The Linux release host is always used for the KVM and Docker checks. Docker
+Sandboxes is tested on it only if you set `LINUX_HOST` on the run that starts the
+release:
+
+```sh
+make release LINUX_HOST=user@host   # also tests Docker Sandboxes on that host
+make release                        # saved host: KVM and Docker there, sandboxes on the Mac only
+```
+
+awman's release tool saves the host after the first successful preflight, and a
+saved host never selects the Linux sandbox check. On a clone with no saved host,
+either pass `LINUX_HOST`, which selects it, or save the host first with
+`git config --local awman.release.linuxHost user@host`. An exported
+`LINUX_HOST` environment variable counts as set.
+
+The choice is fixed when the release starts. Resuming with a different host,
+adding one, or leaving it out while the Linux sandbox check is unfinished stops
+with `sbx-selection-changed`.
+
+### What each check proves
+
+| Check | Proves | Does not prove |
+|---|---|---|
+| Apple Containers and Docker | The release binary selects the runtime, prepares images from a local test fixture without pulling, starts a real container, runs one session with a stand-in agent script and returns its output and exit code; only private test files are mounted; its containers and images are removed | Real agents or providers, authentication, registries, network policy, or other runtime features |
+| Docker Sandboxes | The signed-in `sbx` creates, inspects, runs, stops, restarts and removes a disposable shell sandbox; the guest and a private scratch workspace share files; the release binary reports `ready` for `claude` on the `sbx` runtime | **Provider authentication, effective agent policy, or a successful provider task.** Nothing is claimed for Windows or Linux arm64 |
+
+The checks never run an agent on your machine, send no API key to the Linux
+host, and never sign `sbx` in or out. They clean up their test containers, images
+and sandboxes, and never prune other objects.
+
+### Repairing a blocked check
+
+`BLOCKED` means a prerequisite was missing. Fix it, check with
+`make release-doctor`, then run the same `make release` command again; completed
+work is kept.
+
+| Reported | Fix |
+|---|---|
+| `apple-service-unavailable` | Make sure `container` is installed, run `container system start`, and confirm `container system status` |
+| `docker-daemon-unavailable` | Start Docker on the Linux host, grant the SSH account access to the socket and log in again, then confirm `ssh user@host docker version`. For a non-default socket, set `DOCKER_HOST` for noninteractive SSH sessions |
+| `sbx-cli-missing` or `sbx-cli-too-old` | Install or upgrade `sbx` to 0.54.0 or newer on the named host |
+| `sbx-not-signed-in` | Run `sbx login` on the named host, as the account that runs the check |
+| `sbx-name-occupied` | A sandbox or remote directory already uses a name the check needs. Inspect it with `sbx ls` or on the host before removing anything |
+| `linux-host-unreachable` or `linux-host-prerequisite` | Restore noninteractive SSH, or install the tool named in the message |
+| `sbx-selection-changed` | Set `LINUX_HOST` as it was when the release started, or omit it for a Mac-only selection. To change the selection before the release is sealed, run with `SUPERSEDE=1` |
+
+`FAILED` is different: a check ran and found a defect, including a test object
+that could not be removed. Rerunning does not clear it. Inspect the evidence the
+message names, remove any leftover test objects it lists, fix the cause, commit,
+and run `make release SUPERSEDE=1`.
+
+---
+
 ## Switching runtimes
 
 Change `runtime.kind` to select a supported runtime. Docker and Apple
