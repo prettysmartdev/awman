@@ -10,8 +10,8 @@
 //!   (bottom center) when the user has a selection. Cells are drawn into
 //!   `frame.buffer_mut()` directly so cursor placement, wide chars,
 //!   italic/inverse modifiers, and selection highlight all work.
-//! - **Minimized bars** (`render_container_bars`): 3-row green rounded
-//!   strips with `agent [step] | container | cpu | mem | t` — one per
+//! - **Minimized bars** (`render_container_bars`): 3-row rounded strips
+//!   (green, or the agent's reported-status colour) with `agent [step] | container | cpu | mem | t` — one per
 //!   non-focused slot while the overlay is up, or one per slot when the
 //!   whole group is minimized.
 //! - **Summary** (`render_container_summary`): a 3-row dashed-border strip
@@ -21,9 +21,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::data::program_status::ProgramState;
 use crate::frontend::tui::tabs::{
-    format_duration, ContainerSlot, LastContainerSummary, Tab, TextSelection,
+    format_duration, program_state_color, ContainerSlot, LastContainerSummary, Tab, TextSelection,
 };
 
 /// Render the container overlay when Maximized.
@@ -114,7 +113,7 @@ pub fn render_container_maximized(
         .title(Line::from(right_title).alignment(Alignment::Right))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(slot_border_color(focused_slot)));
 
     // Probe vt100 for the effective offset and total scrollback depth.
     // vt100-ctt 0.17's `set_scrollback` clamps to the buffer length; its
@@ -264,9 +263,19 @@ pub fn render_container_bars(tab: &Tab, area: Rect, frame: &mut Frame, skip_focu
     }
 }
 
+/// Border colour of a stdio container window or minimized bar outside the
+/// stuck / yolo indicators. A slot whose agent reports its status (OSC 7501)
+/// uses the standard state colours ([`program_state_color`]); a silent agent
+/// keeps the container identity green.
+fn slot_border_color(slot: &ContainerSlot) -> Color {
+    slot.program_status
+        .as_ref()
+        .map(|s| program_state_color(s.state))
+        .unwrap_or(Color::Green)
+}
+
 fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
     let stuck = slot.stuck && slot.program_status.is_none();
-    let reported_color = slot.program_status.as_ref().map(|s| s.state);
     let (color, prefix) = if stuck {
         // Yellow + ⚠ prefix for stuck bars.
         (Color::Yellow, "\u{26a0} ")
@@ -279,12 +288,8 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
             Color::Yellow
         };
         (c, "")
-    } else if reported_color == Some(ProgramState::Blocked) {
-        (Color::Yellow, "")
-    } else if reported_color == Some(ProgramState::Error) {
-        (Color::Red, "")
     } else {
-        (Color::Green, "")
+        (slot_border_color(slot), "")
     };
 
     // While yoloing (and not shown maximized — see `render_container_bars`'

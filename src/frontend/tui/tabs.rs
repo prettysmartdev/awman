@@ -647,6 +647,23 @@ pub fn format_duration(secs: u64) -> String {
     }
 }
 
+/// The TUI's standard colour for an agent-reported (OSC 7501) state:
+/// working is the running blue, done and idle green, blocked the "needs you"
+/// yellow, error red. Every surface that colours a reporting agent — the tab,
+/// the container window border and the minimized container bars — uses this.
+pub fn program_state_color(
+    state: crate::data::program_status::ProgramState,
+) -> ratatui::style::Color {
+    use crate::data::program_status::ProgramState;
+    use ratatui::style::Color;
+    match state {
+        ProgramState::Working => Color::Blue,
+        ProgramState::Done | ProgramState::Idle => Color::Green,
+        ProgramState::Blocked => Color::Yellow,
+        ProgramState::Error => Color::Red,
+    }
+}
+
 /// Tab color based on execution state.
 pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     use ratatui::style::Color;
@@ -665,16 +682,10 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     // meanings: working is the running blue, done and idle green, blocked the
     // "needs you" yellow, error red. Reporting agents never get the
     // silence-based stuck colouring; a silent agent keeps the colours below.
-    {
-        use crate::data::program_status::ProgramState;
-        match tab.program_status().map(|s| s.state) {
-            Some(ProgramState::Working) => return Color::Blue,
-            Some(ProgramState::Done | ProgramState::Idle) => return Color::Green,
-            Some(ProgramState::Blocked) => return Color::Yellow,
-            Some(ProgramState::Error) => return Color::Red,
-            None if tab.stuck => return Color::Yellow,
-            None => {}
-        }
+    match tab.program_status().map(|s| s.state) {
+        Some(state) => return program_state_color(state),
+        None if tab.stuck => return Color::Yellow,
+        None => {}
     }
     // Fixed tab kinds. Both win over execution-phase colouring and both yield
     // to the stuck / yolo indicators above, which are transient run signals.

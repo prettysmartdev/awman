@@ -287,7 +287,7 @@ fn render_overview(
                         return line.to_string();
                     }
                     let code = match overview.agents[index - 3].state {
-                        AgentState::Running => "32",
+                        AgentState::Running => "34",
                         AgentState::Stuck => "33",
                         AgentState::Waiting => "33",
                         AgentState::Errored => "31",

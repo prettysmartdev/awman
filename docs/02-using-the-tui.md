@@ -288,7 +288,8 @@ Each minimized bar reads `🔒 agent [step_name] | container | cpu | mem | durat
 
 | Appearance | Meaning |
 |---|---|
-| Green border and text | Container running normally |
+| Green border and text | Container running normally (agent does not report its status) |
+| Blue / green / yellow / red | The agent reports its status: working, done or idle, blocked, error — the same colours as the [tab glyphs](#multi-tab-support). The maximized container window's border uses the same colour |
 | Yellow, `⚠` prefix | No output for longer than the stuck timeout — [stuck](05-workflows.md#stuck-steps) |
 | Flashing purple / yellow, `Yolo in Ns` | A [yolo](03-agent-sessions.md#permission-modes) auto-advance countdown is running for that container; the color alternates every second and the bar shows the seconds remaining |
 
