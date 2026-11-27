@@ -707,10 +707,22 @@ Precedence is per key: a repository value overrides the matching global value, w
 |---|---|---|
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
-| `sbx` | Disabled in v0.14 | Recognized, but agent execution fails with an explicit disabled-runtime error. See [issue #86](https://github.com/prettysmartdev/awman/issues/86) and [Runtimes](11-runtimes.md) |
+| `sbx` | macOS on Apple silicon and Linux x86_64 (experimental) | Docker Sandboxes with per-agent kits and explicit option refusals. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental) |
 | `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in `awman-linux-amd64` and `awman-macos-arm64`; the macOS binary is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `runtime.builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
-`builtin` is experimental; the value itself never says so. In v0.14, selecting `sbx` fails explicitly without falling back to another isolation model. An unrecognized value (e.g. a typo, or one of the old spellings) is also a fatal error. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope and fixed for each awman process (see [Settings fixed for an awman process](#settings-fixed-for-an-awman-process)): fix it in the global file and relaunch. Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM; Linux ARM64 is not supported yet.
+`builtin` and `sbx` are experimental; their configuration values do not include that label. Unsupported SBX hosts fail explicitly without falling back to another isolation model. An unrecognized value (e.g. a typo, or one of the old spellings) is also a fatal error. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope and fixed for each awman process (see [Settings fixed for an awman process](#settings-fixed-for-an-awman-process)): fix it in the global file and relaunch. Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM; Linux ARM64 is not supported yet.
+
+These `sbx` errors stop a launch or `awman ready` before an agent starts. None falls back to another runtime.
+
+| Error | Remedy |
+|---|---|
+| `backend docker-sbx-experimental is not supported on platform …` | Use Apple silicon macOS or Linux x86_64; untested hosts are refused |
+| `Docker Sandboxes CLI <found> is not supported by awman (needs 0.53.0 or newer)` | Upgrade: `brew upgrade docker/tap/sbx` |
+| `could not read the Docker Sandboxes CLI version …` | Reinstall `sbx` and check that `sbx --version` prints a version |
+| `Docker Sandboxes is not available or you are not signed in …` | Run `sbx login`, then retry |
+| `sandbox '<name>' cannot be reused: …` | Save what you need, run `sbx rm <name>`, retry; see [Runtimes](11-runtimes.md#kit-migration-and-recreating-a-sandbox) |
+| `sandbox '<name>' is already in use by another awman session …` | Wait for or stop the other session |
+| `could not apply the launch policy to sandbox '<name>' … The agent was not started.` | Fix the named cause and retry; the sandbox is left as it was |
 
 `awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](11-runtimes.md).
 
@@ -830,7 +842,7 @@ have the effective defaults above.
 | `agents.automation.startupTimeout` | duration | `"120s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_STARTUP_TIMEOUT` | How long an automation launch may take to become ready for a task (1s to 1h). |
 | `agents.automation.cancelTimeout` | duration | `"10s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_CANCEL_TIMEOUT` | Total time to stop an owned agent after cancellation is accepted (1s to 1h). |
 | `agents.automation.outputDrainTimeout` | duration | `"5s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_OUTPUT_DRAIN_TIMEOUT` | How long to collect remaining output after an agent exits; at most the cancel timeout. |
-| `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Agent runtime; `sbx` is disabled in v0.14 and `builtin` is experimental. |
+| `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Agent runtime; `sbx` and `builtin` are experimental. |
 | `runtime.baseImage` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BASE_IMAGE` | Base image tag for setup and teardown containers. |
 | `runtime.dockerfile` | string | `"Dockerfile.dev"` | repo | no | no | `AWMAN_RUNTIME_DOCKERFILE` | Dockerfile, relative to the repo root, that agent images are built from. |
 | `runtime.builtin.stateDir` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_STATE_DIR` | Absolute private state directory of the builtin runtime (default <AWMAN_HOME>/builtin). |

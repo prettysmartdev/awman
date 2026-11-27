@@ -89,6 +89,13 @@ fn every_release_target_is_a_thin_call_into_cargo_xtask_release() {
         assert!(!make.contains(gone), "Makefile still has {gone}");
     }
     assert!(recipe(&make, "validate-native").contains("native-validation run"));
+    let sbx = recipe(&make, "validate-sbx");
+    assert!(sbx.contains("cargo xtask sbx-validation run"));
+    assert!(
+        make.contains("export LINUX_HOST"),
+        "Make command-line Linux destinations must reach xtask unchanged"
+    );
+    assert!(!sbx.contains("release run") && !sbx.contains("--tier boundary"));
 }
 
 fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {

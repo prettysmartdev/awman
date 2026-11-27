@@ -34,23 +34,62 @@ pub struct SandboxRuntime {
     backend: Arc<dyn SandboxBackend>,
 }
 
-// Keep the backend code available for the v3 migration, but refuse all public
-// construction paths in v0.14. See https://github.com/prettysmartdev/awman/issues/86.
-const SBX_RUNTIME_ENABLED: bool = false;
+/// Experimental release switch, enabled after the accepted native smoke on
+/// Apple silicon macOS and Linux x86_64. Platform/option refusals still apply.
+const SBX_RUNTIME_ENABLED: bool = true;
+
+/// Whether construction may proceed past the release switch.
+fn sbx_enabled(env: &crate::data::config::env::EnvSnapshot) -> bool {
+    SBX_RUNTIME_ENABLED || qualification_seam(env)
+}
+
+/// Test and debug builds only: a test-isolated process may reach the
+/// backend so component and boundary tests drive the production `ready`,
+/// `chat` and `exec prompt` paths. The seam does not exist in a release
+/// build, so the shipped binary cannot be talked into enabling the runtime.
+#[cfg(any(test, debug_assertions))]
+fn qualification_seam(env: &crate::data::config::env::EnvSnapshot) -> bool {
+    env.test_isolation()
+}
+#[cfg(not(any(test, debug_assertions)))]
+fn qualification_seam(_: &crate::data::config::env::EnvSnapshot) -> bool {
+    false
+}
+
+/// Platform outcome of the Docker Sandboxes runtime. Apple silicon macOS
+/// and Linux x86_64 have accepted native evidence; other hosts are refused with an
+/// explicit reason. There is no fallback to another runtime.
+fn platform_outcome(os: &str, arch: &str) -> Result<(), EngineError> {
+    let refusal = |platform: String| EngineError::BackendUnsupportedOnPlatform {
+        backend: "docker-sbx-experimental".into(),
+        platform,
+    };
+    match (os, arch) {
+        ("macos", "aarch64") | ("linux", "x86_64") => Ok(()),
+        ("macos", arch) => Err(refusal(format!(
+            "macos/{arch}: Docker Sandboxes supports macOS on Apple silicon only"
+        ))),
+        ("linux", arch) => Err(refusal(format!(
+            "linux/{arch}: not qualified; awman currently supports Docker Sandboxes on Linux x86_64 only"
+        ))),
+        ("windows", _) => Err(refusal(
+            "windows: not qualified. Docker ships Sandboxes for Windows 11, but awman has no \
+             native evidence on this platform"
+                .into(),
+        )),
+        (os, arch) => Err(refusal(format!(
+            "{os}/{arch}: Docker Sandboxes does not support this platform"
+        ))),
+    }
+}
 
 impl SandboxRuntime {
-    /// Prepare this runtime for a single agent at `awman ready` time: check
-    /// the `sbx` binary and login, emit the agent's kit, register
-    /// credentials, and validate the kit. Successful readiness probes stay
-    /// quiet; mutations, warnings and failures are reported on `sink`.
-    ///
-    /// `no_cache` removes the agent's existing awman sandboxes (`sbx rm`)
-    /// before re-emitting the kit, so the next launch re-runs the kit install
-    /// from a clean state.
-    ///
-    /// An inherent method on the runtime rather than the free
-    /// `sandbox::ready_sbx_agent` it replaces (F-40, Tenet 3). F-40b lifts it
-    /// onto `AgentRuntimeEngine` so `ready` stops naming the tier at all.
+    /// Prepare this runtime for a single agent at `awman ready` time: refuse
+    /// an agent without a route, admit the `sbx` client, check sign-in, emit
+    /// and validate the agent's kit, and report sandboxes a launch would
+    /// refuse as stale. Registers no credential and removes no sandbox;
+    /// `no_cache` only lists the agent's sandboxes with their removal
+    /// command. Successful probes stay quiet.
     pub fn ready_agent(
         &self,
         agent: &str,
@@ -61,24 +100,18 @@ impl SandboxRuntime {
     }
 
     /// Construct with the Docker Sandbox (`sbx`) backend.
-    ///
-    /// In v0.14, construction fails before any platform or CLI access because
-    /// the Docker Sandboxes kit format is incompatible with this backend.
     pub fn dsbx() -> Result<Self, EngineError> {
         Self::dsbx_in(crate::engine::host_cli::process_env())
     }
+
+    /// The only construction path. Fails before any platform or CLI access
+    /// while the release switch is off, then admits only Apple silicon macOS
+    /// and Linux x86_64.
     pub fn dsbx_in(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
-        if !SBX_RUNTIME_ENABLED {
+        if !sbx_enabled(&env) {
             return Err(EngineError::SbxRuntimeDisabled);
         }
-        if cfg!(target_os = "linux") {
-            return Err(EngineError::BackendUnsupportedOnPlatform {
-                backend: "docker-sbx-experimental".into(),
-                platform: "linux — blocked until the Docker Sandboxes virtiofs \
-                           file-creation bug (sbx-releases Issue #51) is fixed upstream"
-                    .into(),
-            });
-        }
+        platform_outcome(std::env::consts::OS, std::env::consts::ARCH)?;
         Ok(Self {
             backend: Arc::new(DSbxBackend::with_env(env.clone())),
             env,
@@ -104,7 +137,11 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn is_available(&self) -> bool {
         crate::engine::host_cli::checked_output(
-            crate::engine::host_cli::command(&self.env, self.backend.cli_binary()).arg("ls"),
+            crate::engine::host_cli::command(&self.env, self.backend.cli_binary()).args([
+                "--no-input",
+                "ls",
+                "--json",
+            ]),
             self.backend.cli_binary(),
         )
         .is_ok()
@@ -562,11 +599,53 @@ mod workspace_access_tests {
     use awman_test_support::{TestCase, TestSandbox};
 
     #[test]
-    fn sbx_runtime_is_disabled_for_this_release() {
-        assert!(matches!(
-            SandboxRuntime::dsbx_in(crate::data::config::env::EnvSnapshot::empty()),
-            Err(EngineError::SbxRuntimeDisabled)
-        ));
+    fn sbx_runtime_is_enabled_without_test_isolation_on_supported_release_hosts() {
+        let plain = crate::data::config::env::EnvSnapshot::empty();
+        assert!(
+            sbx_enabled(&plain),
+            "a normal release must enable SBX without a test seam"
+        );
+        let result = SandboxRuntime::dsbx_in(plain);
+        let expected = platform_outcome(std::env::consts::OS, std::env::consts::ARCH);
+        assert_eq!(result.is_ok(), expected.is_ok());
+        assert!(!matches!(result, Err(EngineError::SbxRuntimeDisabled)));
+        // The test seam passes only an isolated test process, and only in
+        // test/debug builds; past it, the platform decides.
+        let isolated =
+            crate::data::config::env::EnvSnapshot::with_overrides([("AWMAN_TEST_ISOLATION", "1")]);
+        assert!(sbx_enabled(&isolated));
+        let result = SandboxRuntime::dsbx_in(isolated);
+        let expected = platform_outcome(std::env::consts::OS, std::env::consts::ARCH);
+        assert_eq!(result.is_ok(), expected.is_ok());
+        if let (Err(got), Err(want)) = (result, expected) {
+            assert_eq!(got.to_string(), want.to_string());
+        }
+    }
+
+    #[test]
+    fn accepted_mac_arm64_and_linux_x64_pass_and_untested_hosts_are_refused() {
+        assert!(platform_outcome("macos", "aarch64").is_ok());
+        assert!(platform_outcome("linux", "x86_64").is_ok());
+        let linux = platform_outcome("linux", "aarch64")
+            .unwrap_err()
+            .to_string();
+        assert!(linux.contains("linux/aarch64: not qualified"), "{linux}");
+        let windows = platform_outcome("windows", "x86_64")
+            .unwrap_err()
+            .to_string();
+        assert!(windows.contains("windows: not qualified"), "{windows}");
+        assert!(platform_outcome("macos", "x86_64").is_err());
+        assert!(platform_outcome("freebsd", "x86_64").is_err());
+        for (os, arch) in [
+            ("linux", "aarch64"),
+            ("windows", "aarch64"),
+            ("macos", "x86_64"),
+        ] {
+            assert!(matches!(
+                platform_outcome(os, arch),
+                Err(EngineError::BackendUnsupportedOnPlatform { .. })
+            ));
+        }
     }
 
     #[test]

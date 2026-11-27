@@ -1,5 +1,5 @@
 //! One function per phase of design 3.1; `run.rs` decides which to run.
-mod hosted;
+pub(super) mod hosted;
 mod publish;
 pub mod seal;
 

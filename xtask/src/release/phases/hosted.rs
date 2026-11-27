@@ -692,7 +692,15 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
             .map_err(anyhow::Error::from)?;
     }
     let mut kit = None;
-    if let Some(nid) = ctx.plan.asset(asset).and_then(|p| p.native.clone()) {
+    let mut additional_kits = BTreeMap::new();
+    let ids: Vec<_> = ctx
+        .plan
+        .native
+        .iter()
+        .filter(|n| n.asset == asset)
+        .map(|n| n.id.clone())
+        .collect();
+    for nid in ids {
         let n = ctx
             .plan
             .native(&nid)
@@ -743,12 +751,17 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
                 stop!("mac-host", "the kit needs {suffix} socket path bytes below the private root; the canonical root is too long");
             }
         }
-        kit = Some(KitRecord {
+        let record = KitRecord {
             artifact_id: ka.id,
             sha256: ksha,
             metadata_sha256: sha256_file(&ctx.store.path(&format!("kits/{nid}/kit.json")))?,
             attestation: att,
-        });
+        };
+        if ctx.plan.asset(asset).and_then(|a| a.native.as_ref()) == Some(&nid) {
+            kit = Some(record);
+        } else {
+            additional_kits.insert(nid, record);
+        }
     }
     let rec = ctx.j.builds.entry(asset.to_string()).or_default();
     rec.artifact_id = Some(a.id);
@@ -757,6 +770,7 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
     rec.attestation = Some(attestation);
     rec.build_json_sha256 = Some(sha256_file(&build_json)?);
     rec.kit = kit;
+    rec.additional_kits = additional_kits;
     rec.run_attempt = run.attempt;
     rec.validated = Some(run.updated);
     service_stage(ctx, &format!("build.{asset}"), &run);
@@ -771,7 +785,12 @@ fn job(ctx: &Ctx, id: &str) -> Step<Option<NativeJob>> {
     let Some(b) = ctx.j.builds.get(&n.asset).filter(|b| b.validated.is_some()) else {
         return Ok(None);
     };
-    let Some(kit) = &b.kit else { return Ok(None) };
+    let kit = if ctx.plan.asset(&n.asset).and_then(|a| a.native.as_deref()) == Some(id) {
+        b.kit.as_ref()
+    } else {
+        b.additional_kits.get(id)
+    };
+    let Some(kit) = kit else { return Ok(None) };
     let out_dir = ctx.store.path(&format!("native/{id}"));
     crate::release::util::private_dir(&out_dir)?;
     let downloads = if n.host == "local" {
@@ -818,6 +837,20 @@ pub(super) fn verify_native_records(ctx: &Ctx) -> Step {
             )
         })?;
         let actual = native::verify_result(&job, &path, exit)?;
+        if n.id == crate::manifest::release_policy::SBX_NATIVE
+            && ctx.j.release.seal_sha256.is_none()
+        {
+            let current = ctx.w.hosts.sbx_qualification()?;
+            let recorded: crate::release::sbx::Qualification =
+                serde_json::from_value(actual.sbx.clone().unwrap_or_default())
+                    .map_err(anyhow::Error::from)?;
+            if current != recorded {
+                stop!(
+                    "native-result-invalid",
+                    "SBX qualification changed before seal"
+                );
+            }
+        }
         if ctx.j.native.get(&n.id) != Some(&actual) {
             stop!(
                 "native-result-invalid",
@@ -953,4 +986,17 @@ pub fn native_phase(ctx: &mut Ctx) -> Step {
         }
         ctx.w.clock.sleep(ctx.w.poll_seconds.min(10));
     }
+}
+
+/// Reconcile retained SBX bytes before replacement under new qualification inputs.
+pub(crate) fn verify_sbx_retained(ctx: &Ctx) -> Step {
+    let id = crate::manifest::release_policy::SBX_NATIVE;
+    let job = job(ctx, id)?.ok_or_else(|| Stop::new("native-result-invalid", "SBX kit missing"))?;
+    let (path, exit) = native::durable(&job)
+        .ok_or_else(|| Stop::new("native-result-invalid", "SBX result missing"))?;
+    let actual = native::verify_result(&job, &path, exit)?;
+    if ctx.j.native.get(id) != Some(&actual) {
+        stop!("native-result-invalid", "SBX evidence changed");
+    }
+    Ok(())
 }

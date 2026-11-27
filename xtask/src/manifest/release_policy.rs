@@ -43,7 +43,29 @@ pub const RELEASE_SUITES: &[&str] = &[
     "xtask-gates",
     "component-test-support",
 ];
+pub const SBX_NATIVE: &str = "native.macos-arm64-sbx";
+pub const SBX_SUITE: &str = "artifact-sbx-smoke";
+pub const SBX_CASES: &[(&str, &str, &str, &str)] = &[
+    (
+        "claude",
+        "claude_published_workload_ready_and_headless_task",
+        "published-workload-with-mixin",
+        "awman-claude-mixin",
+    ),
+    (
+        "opencode",
+        "opencode_owned_workload_ready_and_headless_task",
+        "owned-workload",
+        "awman-opencode",
+    ),
+];
 pub fn native_tests(id: &str) -> Result<Vec<String>> {
+    if id == SBX_NATIVE {
+        return Ok(SBX_CASES
+            .iter()
+            .map(|(_, name, _, _)| format!("awman-cli::artifact sbx_smoke::{name}"))
+            .collect());
+    }
     let names: &[&str] = match id {
         "native.macos-arm64" => &[
             "signed_artifact_runs_an_offline_session",
@@ -153,8 +175,8 @@ pub fn validate(m: &Manifest) -> Result<()> {
         "invalid evidence validity/retention"
     );
     ensure!(
-        m.release.native.len() == 2,
-        "both native obligations required"
+        m.release.native.len() == 3,
+        "two required native checks and the opt-in SBX diagnostic must remain registered"
     );
     for (id, asset, suite, fixture, arch) in [
         (
@@ -219,6 +241,52 @@ pub fn validate(m: &Manifest) -> Result<()> {
                 && s.not_overridable
                 && tests.iter().all(|t| s.tests.contains(t))),
             "missing native critical test IDs"
+        );
+    }
+    let sbx = m
+        .release
+        .native
+        .get(SBX_NATIVE)
+        .context("missing SBX native obligation")?;
+    ensure!(
+        !sbx.required
+            && sbx.asset == "awman-macos-arm64"
+            && sbx.host == "local"
+            && sbx.suites == [SBX_SUITE]
+            && sbx.fixtures.is_empty()
+            && sbx.previous_release.is_none()
+            && sbx.budget_seconds == 1500,
+        "invalid opt-in SBX diagnostic; experimental provider smoke must not gate release"
+    );
+    let suite = &m.suites[SBX_SUITE];
+    ensure!(
+        suite.tier == "artifact"
+            && suite.package.as_deref() == Some("awman-cli")
+            && suite.target.as_deref() == Some("test:artifact")
+            && suite.budget_seconds == Some(600)
+            && suite.requires == ["docker-sbx", "sbx-test-identity", "public-network"],
+        "invalid SBX suite"
+    );
+    let filter = native_filter(SBX_NATIVE)?;
+    ensure!(
+        suite.filter.as_deref() == Some(&filter),
+        "SBX suite must select exactly the two smoke cases"
+    );
+    for (id, other) in &m.suites {
+        ensure!(
+            other.tier != "artifact"
+                || id == SBX_SUITE
+                || !other
+                    .requires
+                    .iter()
+                    .any(|c| c == "docker-sbx" || c == "sbx-test-identity"),
+            "SBX artifact grant restricted to smoke suite"
+        );
+    }
+    for gate in m.gates.keys() {
+        ensure!(
+            !cells(m, gate)?.iter().any(|c| c.suite == SBX_SUITE),
+            "SBX smoke is native-only"
         );
     }
     ensure!(
@@ -314,4 +382,15 @@ pub fn digest(m: &Manifest) -> Result<String> {
         "switches":m.shipped_switch,"quarantine":m.quarantine,"overrides":m.overrides,
         "test_env":m.test_env,"source_inputs":source_inputs
     }))
+}
+
+/// Stable exact test selection shared by kit production and qualification evidence.
+pub fn native_filter(id: &str) -> Result<String> {
+    let mut tests = native_tests(id)?;
+    tests.sort();
+    Ok(tests
+        .iter()
+        .map(|t| format!("test(={})", t.split_once(' ').unwrap().1))
+        .collect::<Vec<_>>()
+        .join(" | "))
 }

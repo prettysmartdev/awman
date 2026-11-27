@@ -358,6 +358,8 @@ fn restore_sealed_evidence(
         b.build_json_sha256 = a["build"]["build_json_sha256"].as_str().map(str::to_string);
         b.attestation = serde_json::from_value(a["attestation"].clone()).ok();
         b.kit = serde_json::from_value(a["kit"].clone()).ok();
+        b.additional_kits =
+            serde_json::from_value(a["additional_kits"].clone()).unwrap_or_default();
         b.validated = time(&a["validated"]);
     }
     j.native = serde_json::from_value(ev["native"].clone()).unwrap_or_default();
@@ -616,6 +618,40 @@ fn remaining(j: &Journal, plan: &Plan) -> (BTreeSet<&'static str>, Vec<String>) 
 
 fn resume_checks(ctx: &mut Ctx) -> Step {
     ctx.timing("preflight", "start", "resume");
+    // Reuse a passed SBX check only for the same currently qualified CLI and identity.
+    // Sealed evidence is immutable and publication retries need no native host.
+    let sbx_id = crate::manifest::release_policy::SBX_NATIVE;
+    if ctx.j.release.seal_sha256.is_none()
+        && ctx
+            .j
+            .native
+            .get(sbx_id)
+            .is_some_and(|r| r.outcome == "passed")
+    {
+        let current = ctx.w.hosts.sbx_qualification()?;
+        let old = ctx.j.native[sbx_id].sbx.clone().unwrap_or_default();
+        if serde_json::to_value(&current).map_err(anyhow::Error::from)? != {
+            let mut old = old;
+            if let Some(o) = old.as_object_mut() {
+                o.remove("cases");
+                o.remove("ownership_sha256");
+            }
+            old
+        } {
+            // Verify old raw proof before invalidating it; tampering is a failure.
+            super::phases::hosted::verify_sbx_retained(ctx)?;
+            ctx.j.native.remove(sbx_id);
+            let out = ctx.store.path(&format!("native/{sbx_id}"));
+            let retained = ctx
+                .store
+                .path(&format!("native/{sbx_id}-previous-{}", random_id()?));
+            std::fs::rename(out, retained).map_err(anyhow::Error::from)?;
+            for phase in ["native", "seal", "confirm"] {
+                ctx.j.phases.remove(phase);
+            }
+            ctx.save()?;
+        }
+    }
     let (phases, natives) = remaining(&ctx.j, &ctx.plan);
     let natives = if phases.contains("native") {
         natives

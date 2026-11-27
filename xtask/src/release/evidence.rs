@@ -134,6 +134,7 @@ pub fn release_evidence(j: &Journal) -> serde_json::Value {
                           "artifact_id": b.artifact_id, "build_json_sha256": b.build_json_sha256},
                 "attestation": b.attestation,
                 "kit": b.kit,
+                "additional_kits": b.additional_kits,
                 "validated": b.validated,
             })
         })

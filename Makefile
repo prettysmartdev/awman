@@ -95,9 +95,15 @@ test-artifact:
 # Broad native diagnostic (guest, boundary and soak breadth) on this host: an
 # Apple Silicon Mac or a Linux KVM machine. Not part of a release; its
 # evidence directory is checked with `cargo xtask native-validation verify DIR`.
-.PHONY: validate-native
+.PHONY: validate-native validate-sbx
 validate-native:
 	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
+
+# Experimental smoke test of the logged-in SBX session; no API keys or setup.
+SBX_VALIDATION_DIR ?= $(TARGET_DIR)/sbx-validation
+export LINUX_HOST
+validate-sbx:
+	cargo xtask sbx-validation run --out "$(SBX_VALIDATION_DIR)"
 
 gates:
 	cargo xtask gates check

@@ -6,7 +6,7 @@ use super::definition::{
     AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CliMajorRequirement,
     CredentialSource, InteractiveModelFallback, InteractiveSeedDelivery, ModeRefusal, ModeSelector,
     ModelFlagDelivery, NativePlanKind, NativePlanSpec, NativeSettingsPatch, PlanConfigGuard,
-    SbxKitKind, SelectorArity, SessionStorageDir, SettingsMount, SystemPromptMode,
+    SelectorArity, SessionStorageDir, SettingsMount, SystemPromptMode,
 };
 
 /// The eight built-in agents. Same slice as the Layer 0 constant so Layer 0
@@ -99,7 +99,6 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         acp_entrypoint: None,
         system_prompt_delivery: SystemPromptMode::Unsupported,
         system_prompt_flag: None,
-        sbx_kit_kind: SbxKitKind::Mixin,
         settings_mount: SettingsMount::None,
         extra_settings_mounts: Vec::new(),
         session_storage_dirs: Vec::new(),
@@ -112,8 +111,6 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         ping_argv: None,
         static_env: Vec::new(),
         auth_env: Vec::new(),
-        sandbox_permission_mode_supported: false,
-        sandbox_model_note: None,
         sandbox_auth_env_vars: Vec::new(),
         deprecation_note: None,
         strict_modes: false,
@@ -124,7 +121,6 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         interactive_model_fallback: None,
         cli_version: None,
         launch_note: None,
-        sandbox_auth_note: None,
     }
 }
 
@@ -155,7 +151,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // The cheapest Claude model is pinned so the refresh ping never
             // uses the account default (which may be a premium model).
             ping_argv: Some(strings(&["claude", "--model", "haiku", "--print"])),
-            sandbox_permission_mode_supported: true,
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
             ..base("claude", "Claude Code")
         },
@@ -249,7 +244,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ping_argv: None,
             // A mixin kit cannot guarantee the major or the headless
             // subcommand; awman owns the kit.
-            sbx_kit_kind: SbxKitKind::Agent,
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
             cli_version: Some(CliMajorRequirement {
                 binary: "opencode".into(),
@@ -338,8 +332,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ],
             skills_mount: Some(".config/opencode/skills".into()),
             ping_argv: None,
-            sbx_kit_kind: SbxKitKind::Agent,
-            sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
+            sandbox_auth_env_vars: Vec::new(),
             cli_version: Some(CliMajorRequirement {
                 binary: "opencode".into(),
                 required_major: 2,
@@ -403,14 +396,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // CURSOR_API_KEY only when the user names it with env()/a secret.
             auth_env: Vec::new(),
             ping_argv: None,
-            sbx_kit_kind: SbxKitKind::Agent,
             sandbox_auth_env_vars: Vec::new(),
-            sandbox_auth_note: Some(
-                "CURSOR_API_KEY cannot be delivered to 'cursor' under the sandbox runtime yet; \
-                 use runtime.kind \
-                 docker, apple or builtin with env(CURSOR_API_KEY)"
-                    .into(),
-            ),
             ..base("cursor", "Cursor Agent")
         },
         "copilot" => AgentDefinition {
@@ -440,12 +426,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             settings_mount: SettingsMount::Direct(".copilot".into()),
             skills_mount: Some(".copilot/skills".into()),
             ping_argv: Some(strings(&["copilot", "-p"])),
-            sandbox_model_note: Some(
-                "--model cannot be applied to copilot under the sandbox runtime (no \
-                 mixin-safe config); use the /model slash command inside the session \
-                 instead"
-                    .into(),
-            ),
             sandbox_auth_env_vars: strings(&["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]),
             ..base("copilot", "GitHub Copilot CLI")
         },
@@ -476,7 +456,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             acp_entrypoint: Some(strings(&["cline", "--acp"])),
             system_prompt_delivery: SystemPromptMode::Replace,
             system_prompt_flag: Some("--system".into()),
-            sbx_kit_kind: SbxKitKind::Agent,
             settings_mount: SettingsMount::Direct(".cline/data".into()),
             skills_mount: Some(".cline/skills".into()),
             ping_argv: Some(strings(&["cline", "--json"])),
@@ -502,7 +481,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             system_prompt_delivery: SystemPromptMode::AddDir {
                 flag: "--add-dir".into(),
             },
-            sbx_kit_kind: SbxKitKind::Agent,
             settings_mount: SettingsMount::Antigravity,
             skills_mount: Some(".gemini/antigravity-cli/skills".into()),
             credential_source: CredentialSource::AntigravityKeychainFile,
@@ -718,4 +696,35 @@ fn profile_spec(name: &str) -> Option<super::profile_state::ProfileStateSpec> {
         },
         database_history: db,
     })
+}
+
+#[cfg(test)]
+mod sbx_matrix_tests {
+    use super::*;
+    use crate::engine::agent::sbx_contract::{SbxDisposition, SBX_AGENTS};
+
+    #[test]
+    fn definitions_agree_with_every_matrix_disposition_and_policy_delivery() {
+        assert_eq!(SBX_AGENTS.len(), FIRST_PARTY_AGENTS.len());
+        for agent in FIRST_PARTY_AGENTS {
+            let def = first_party(agent).unwrap();
+            let route = def.sbx_route().unwrap();
+            assert!(SBX_AGENTS.contains(agent));
+            assert_eq!(route.agent, *agent);
+            assert_eq!(
+                def.requires_private_session,
+                !route.is_supported(),
+                "{agent}"
+            );
+            if route.is_supported() {
+                assert_eq!(
+                    route.is_owned_workload(),
+                    ["opencode", "cline", "antigravity"].contains(agent)
+                );
+            } else {
+                assert!(matches!(route.disposition, SbxDisposition::Refused { .. }));
+                assert!(route.kit_handle().is_none());
+            }
+        }
+    }
 }

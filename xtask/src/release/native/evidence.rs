@@ -69,6 +69,9 @@ pub(super) fn verify(job: &NativeJob, path: &Path) -> Step {
                 "raw {name} digest mismatch"
             );
         }
+        if job.plan.id == crate::manifest::release_policy::SBX_NATIVE {
+            super::super::sbx::verify(out, &r["sbx"])?;
+        }
         let expected: Value = read_json(&out.join("expected.json"))?;
         let inventory = crate::evidence::actions::expected(&expected)?;
         let want: BTreeSet<_> = job.plan.tests.iter().cloned().collect();

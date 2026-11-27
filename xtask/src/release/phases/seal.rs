@@ -381,7 +381,15 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
         ctx.j.ci.run_attempt
     ));
     for (id, n) in &ctx.j.native {
-        s.push_str(&format!("  {id:<20} {}\n", n.outcome));
+        s.push_str(&format!("  {id:<20} {}", n.outcome));
+        if let Some(q) = &n.sbx {
+            s.push_str(&format!(
+                " (sbx {}, operator label {})",
+                q["cli_version"].as_str().unwrap_or("?"),
+                q["operator_label"].as_str().unwrap_or("?")
+            ));
+        }
+        s.push('\n');
     }
     for line in crate::release::status::advisories(ctx.w, &ctx.plan.ci.workflow) {
         s.push_str(&format!("  {line}\n"));

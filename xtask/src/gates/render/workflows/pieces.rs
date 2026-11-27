@@ -7,6 +7,8 @@ pub const CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273b
 pub const CACHE_RESTORE: &str =
     "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
 pub const CACHE_SAVE: &str = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0";
+pub const ATTEST: &str =
+    "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2";
 pub const UPLOAD: &str =
     "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2";
 pub const DOWNLOAD: &str =

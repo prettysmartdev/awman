@@ -710,6 +710,16 @@ fn release_policy_refuses_added_cells_removed_obligations_and_waivers() {
         .required = false;
     assert!(error(&m).contains("required native"));
     let mut m = manifest();
+    m.release
+        .native
+        .get_mut(manifest::release_policy::SBX_NATIVE)
+        .unwrap()
+        .required = true;
+    assert!(
+        error(&m).contains("opt-in SBX diagnostic"),
+        "provider credentials must not re-enter the release critical path"
+    );
+    let mut m = manifest();
     m.gates.get_mut("release").unwrap().cells[0]
         .suites
         .retain(|s| s != "component-security");
@@ -800,4 +810,55 @@ fn release_verify_credits_each_shard_to_its_own_producer_across_attempts() {
     for conclusion in ["skipped", "cancelled", "timed_out"] {
         assert!(producer_job(&[job(10, 0, 1, conclusion)], title, 0, 42, 1, 1).is_err());
     }
+}
+
+#[test]
+fn sbx_smoke_is_exact_bounded_and_absent_from_every_hosted_gate() {
+    let m = manifest();
+    let p = super::release_plan::create(&m).unwrap();
+    assert!(
+        !p["native"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == manifest::release_policy::SBX_NATIVE),
+        "experimental SBX must not require provider credentials for release"
+    );
+    let n = &m.release.native[manifest::release_policy::SBX_NATIVE];
+    assert_eq!(n.asset, "awman-macos-arm64");
+    assert_eq!(n.host, "local");
+    assert!(!n.required);
+    assert_eq!(n.budget_seconds, 1500);
+    assert!(n.fixtures.is_empty());
+    for gate in m.gates.keys() {
+        assert!(!manifest::validate::cells(&m, gate)
+            .unwrap()
+            .iter()
+            .any(|c| c.suite == manifest::release_policy::SBX_SUITE));
+    }
+}
+
+#[test]
+fn nightly_sbx_executes_the_registered_cell_only_when_the_platform_has_labels() {
+    let mut m = manifest();
+    let rendered = super::render::workflows::outputs(&m)
+        .unwrap()
+        .into_iter()
+        .find(|(p, _)| p.ends_with("nightly.yml"))
+        .unwrap()
+        .1;
+    assert!(rendered.contains("BLOCKED [infrastructure]: macos-arm64-sbx has no runs_on labels"));
+    assert!(!rendered.contains("blocked until issue 86"));
+    m.platforms.get_mut("macos-arm64-sbx").unwrap().runs_on = vec!["sbx-qualified-mac".into()];
+    let rendered = super::render::workflows::outputs(&m)
+        .unwrap()
+        .into_iter()
+        .find(|(p, _)| p.ends_with("nightly.yml"))
+        .unwrap()
+        .1;
+    assert!(rendered.contains("runs-on: sbx-qualified-mac"));
+    assert!(rendered.contains(
+        "cargo xtask test run --suite boundary-sbx --build macos-arm64-ci-guest-builtin"
+    ));
+    assert!(!rendered.contains("BLOCKED [infrastructure]"));
 }

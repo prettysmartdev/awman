@@ -260,7 +260,7 @@ If the header is still present but the body differs from what the definition wou
 
 ## Runtimes
 
-Custom agents run on **Docker**, **Apple Containers** and **builtin**. Docker Sandboxes (`sbx`) is disabled in v0.14 and selecting it fails before agent preparation. See [Runtimes](11-runtimes.md).
+Custom agents run on **Docker**, **Apple Containers** and **builtin**. Docker Sandboxes (`sbx`) supports only its listed first-party routes and refuses custom agents before preparation. See [Runtimes](11-runtimes.md).
 
 ---
 

@@ -90,6 +90,8 @@ pub enum SandboxOption {
 /// sandbox backend consumes.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSandboxOptions {
+    /// Authority and source identities admitted by the engine, retained to create.
+    pub mount_guard: Option<crate::data::mount_authority::MountSourceGuard>,
     pub host_env: Option<crate::data::config::env::EnvSnapshot>,
     pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     /// Kit selector.

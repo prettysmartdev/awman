@@ -42,9 +42,9 @@ pub fn create(m: &Manifest) -> Result<Value> {
             "toolchain":p.toolchain,"cargo":cargo,"binary":format!("{dir}/awman{}",if p.triple.contains("windows") {".exe"} else {""}),
             "sign":p.triple.contains("apple"),"abi":if asset == "awman-linux-amd64" {Some("glibc-2.35")} else {None},
             "builder":"hosted","smoke_suites":m.release.smoke_suites,
-            "native":m.release.native.iter().find(|(_,n)| &n.asset == asset).map(|(id,_)| id)}));
+            "native":m.release.native.iter().find(|(_,n)| n.required && &n.asset == asset).map(|(id,_)| id)}));
     }
-    let native = m.release.native.iter().map(|(id,n)| -> Result<Value> {
+    let native = m.release.native.iter().filter(|(_, n)| n.required).map(|(id,n)| -> Result<Value> {
         let b = m.builds.values().find(|b| b.asset.as_ref() == Some(&n.asset)).context("native asset missing")?;
         let fixtures = n.fixtures.iter().map(|id| -> Result<Value> {
             let f = m.fixtures.get(id).context("native fixture missing")?;

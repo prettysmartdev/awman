@@ -68,9 +68,9 @@ authenticated evidence proves every required cell at the exact release commit.
 **What blocks a release.** (1) The `release` gate. (2) For each of the four
 shipping assets, an attested build by `release.yml`, then the three exact-byte
 smoke suites (smoke, entrypoints, access reduction) on that asset's hosted OS.
-(3) Two native checks on operator machines, narrowed to the three tests named in
+(3) Two native checks on operator machines, narrowed to the tests named in
 the release plan: signed offline boot and persisted-state upgrade of the macOS
-asset, and offline KVM boot of the Linux amd64 asset. (4) Anonymous verification
+asset and offline KVM boot of the Linux amd64 asset. Experimental SBX provider smoke is an opt-in diagnostic and does not gate release. (4) Anonymous verification
 of the published bytes. Nothing else blocks; the evidence is verified by
 `cargo xtask gates verify-release-evidence`, never trusted from a summary.
 
@@ -82,7 +82,8 @@ of the published bytes. Nothing else blocks; the evidence is verified by
 | Artifact dependency/helper scan, upgrade policy, measurement on all four assets | `nightly-artifacts` |
 | Native guest boot/exec/import/network/builder/strategy, builtin Mac units, guest soak, Apple and Linux Docker, registry and Git boundaries, template, offline and private-memory suites, Linux replacement and published-predecessor upgrade | `native-diagnostic`, run by an operator with no schedule. A missing predecessor or infrastructure is blocked evidence, never a pass |
 | Standalone kit relocation | `nightly-kit` |
-| Disabled `sbx` boundary | reported BLOCKED by the nightly `sandbox-coverage` job until [issue #86](https://github.com/prettysmartdev/awman/issues/86) |
+| `sbx` boundary (`boundary-sbx`) | nightly `sandbox-coverage` runs the registered cell. While the `macos-arm64-sbx` platform has no `runs_on` runner it exits 2 with infrastructure BLOCKED naming the platform and cell. With runner labels it installs the pinned runner, executes the suite on the registered build and uploads evidence. It stays diagnostic in the nightly verdict |
+| SBX provider artifact smoke (`artifact-sbx-smoke`) | opt-in native diagnostic, excluded from the release plan and hosted asset build; selected runs retain their strict identity, credential and cleanup requirements |
 | Reproduction of the four shipping assets | removed as a release blocker; the nightly `repro-build` observes only Linux x64 default |
 | Duplicate main-gate, candidate and promotion gates | removed |
 
@@ -307,6 +308,13 @@ see [testing.md](testing.md#reproducing-a-ci-failure).
 
 ## Evidence limits
 
-The two required native checks run only through `make release`, on exact attested bytes, and a missing, blocked or short result prevents sealing. No hosted-Mac compilation or Linux pass is native runtime proof. `make validate-native` is a broad operator diagnostic whose evidence directory is checked with `cargo xtask native-validation verify DIR`; it is not part of a release and cannot authorize one. Guest fixtures are pinned to published, architecture-specific archives; a pending pin blocks. Native results are operator evidence, not Actions attestations. Real native boot and upgrade, SSH transport, the Windows firewall and complete publication timing are measured separately in [release-measurements.md](release-measurements.md), not claimed by the local tests.
+The three required native checks run only through `make release`, on exact attested bytes, and a missing, blocked or short result prevents sealing. No hosted-Mac compilation or Linux pass is native runtime proof. `make validate-native` is a broad operator diagnostic whose evidence directory is checked with `cargo xtask native-validation verify DIR`; it is not part of a release and cannot authorize one. Guest fixtures are pinned to published, architecture-specific archives; a pending pin blocks. Native results are operator evidence, not Actions attestations. Real native boot and upgrade, SSH transport, the Windows firewall and complete publication timing are measured separately in [release-measurements.md](release-measurements.md), not claimed by the local tests.
 
 Coverage and mutation results are diagnostics. Performance reports must distinguish cold builds, warm runs and queue time; a single run does not establish p95 or a flake rate. Dependency advisories are reviewed separately from the licenses, bans and sources gate.
+
+A provisioned `sandbox-coverage` job derives all grants from `boundary-sbx`
+requirements and reads the dedicated SBX HOME, operator label, provider-key
+file and optional provider directory from the correspondingly named Actions
+secrets. Paths name files provisioned on that runner. It verifies the builtin
+payload before execution. An unprovisioned platform and an all-BLOCKED suite
+return exit 2; product and cleanup failures return exit 1.

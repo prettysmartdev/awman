@@ -132,6 +132,8 @@ pub struct BuildRecord {
     pub build_json_sha256: Option<String>,
     #[serde(default)]
     pub kit: Option<KitRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub additional_kits: BTreeMap<String, KitRecord>,
     #[serde(default)]
     pub validated: Option<DateTime<Utc>>,
 }
@@ -148,6 +150,8 @@ pub struct NativeRecord {
     pub finished: Option<DateTime<Utc>>,
     #[serde(default)]
     pub host: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sbx: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

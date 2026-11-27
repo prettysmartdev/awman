@@ -219,6 +219,7 @@ local-registry = {}
 git-transports = {}
 apple-containers = {}
 docker-sbx = {}
+sbx-test-identity = {}
 hypervisor = {}
 builtin-payload = {}
 guest-fixtures = {}
@@ -237,7 +238,7 @@ guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "
 [tiers.boundary]
 budget_seconds = 120
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
-allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures", "offline"]
+allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "sbx-test-identity", "public-network", "guest-fixtures", "offline"]
 [tiers.guest]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures"]
@@ -245,7 +246,7 @@ allowed_capabilities = ["docker", "apple-containers", "previous-release", "local
 [tiers.artifact]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]
-allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
+allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network"]
 [tiers.soak]
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary"]
 allowed_capabilities = ["docker", "hypervisor", "guest-fixtures", "public-network", "registry-credentials"]
@@ -261,7 +262,7 @@ mod tests {
         for tier in Tier::ALL {
             assert!(config.tiers.contains_key(tier.name()), "{tier}");
         }
-        assert_eq!(config.capabilities.len(), 19);
+        assert_eq!(config.capabilities.len(), 20);
     }
 
     #[test]

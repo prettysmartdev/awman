@@ -71,6 +71,9 @@ description = "private Apple Containers service"
 [capabilities.docker-sbx]
 description = "Docker sandbox CLI"
 
+[capabilities.sbx-test-identity]
+description = "isolated Docker Sandboxes sign-in and provider credential"
+
 [capabilities.hypervisor]
 description = "HVF or KVM"
 
@@ -106,7 +109,7 @@ guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "
 [tiers.boundary]
 budget_seconds = 120
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
-allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures", "offline"]
+allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "sbx-test-identity", "public-network", "guest-fixtures", "offline"]
 
 [tiers.guest]
 budget_seconds = 300
@@ -116,7 +119,7 @@ allowed_capabilities = ["docker", "apple-containers", "previous-release", "local
 [tiers.artifact]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]
-allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
+allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network"]
 
 [tiers.soak]
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary"]
@@ -264,12 +267,14 @@ contracts = ["unit-awman"]
 requires = []
 paths = []
 always = true
-filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::mount_authority::tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/) | test(/^engine::worker::terminal_relay::tests::/)"
+filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::mount_authority::tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/) | test(/^engine::worker::terminal_relay::tests::/) | test(/^data::templates::tests::/) | test(/^engine::agent::sbx_contract::tests::/) | test(/^engine::agent::definition::sbx_tests::/) | test(/^engine::agent::first_party::sbx_matrix_tests::/) | test(/^engine::error::sbx_error_tests::/) | test(/^engine::sandbox::dsbx::cli::argv_tests::/) | test(/^engine::sandbox::dsbx::session_config::tests::/) | test(/^engine::sandbox::dsbx::auth::tests::/) | test(/^engine::sandbox::dsbx::ready::tests::/)"
 
 # Includes frontend::cli::wait_failure_tests and container::io_bridge::inactivity_tests.
 # WI 0070 native plan: also command::commands::launch_policy::agent_policy_tests,
 # engine::acp::session::start_mode_tests, engine::agent::native_plan_option_tests and
 # data::jsonc::tests; tests/component/command/native_plan.rs is in component-command.
+# SBX adversarial regressions: backend::launch_tests (mount swap, reuse refusal,
+# secret echo, descendant pipes), kit::script_tests (context ownership).
 [suites.component-core-internals]
 tier = "component"
 kind = "nextest"
@@ -279,7 +284,7 @@ contracts = ["component-core-internals"]
 requires = []
 paths = []
 always = true
-filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::mount_authority::tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/) | test(/^engine::worker::terminal_relay::tests::/) | test(/^command::worker::terminal::tests::/))"
+filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::mount_authority::tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/) | test(/^engine::worker::terminal_relay::tests::/) | test(/^data::templates::tests::/) | test(/^engine::agent::sbx_contract::tests::/) | test(/^engine::agent::definition::sbx_tests::/) | test(/^engine::agent::first_party::sbx_matrix_tests::/) | test(/^engine::error::sbx_error_tests::/) | test(/^engine::sandbox::dsbx::cli::argv_tests::/) | test(/^engine::sandbox::dsbx::session_config::tests::/) | test(/^engine::sandbox::dsbx::auth::tests::/) | test(/^engine::sandbox::dsbx::ready::tests::/) | test(/^command::worker::terminal::tests::/))"
 
 [suites.unit-wsp]
 tier = "unit"
@@ -300,6 +305,7 @@ contracts = ["component-wsp-terminals"]
 requires = []
 paths = ["crates/awman-wsp/**", "src/engine/worker/terminal_relay.rs"]
 
+# SBX strict cleanup listing regression: sbx::tests (unit-test-support).
 [suites.unit-test-support]
 tier = "unit"
 kind = "nextest"
@@ -321,6 +327,8 @@ paths = []
 always = true
 filter = "test(/^worker::tests::/)"
 
+# Includes release::sbx::tests, sbx_validation::tests (logged-in smoke/cleanup/report),
+# test::kit::tests and the provisioned nightly generator.
 [suites.unit-xtask]
 tier = "component"
 kind = "nextest"
@@ -571,15 +579,18 @@ paths = ["src/engine/**", "tests/boundary/**"]
 filter = "test(/^apple::/)"
 group = "apple"
 
+# Native policy sentinels and no-receipt launcher gate are selected by ^sbx::.
 [suites.boundary-sbx]
 tier = "boundary"
 kind = "nextest"
 package = "awman-cli"
 target = "test:boundary"
 contracts = ["boundary-sbx"]
-requires = ["docker-sbx"]
-paths = ["src/engine/**", "tests/boundary/**"]
+requires = ["docker-sbx", "sbx-test-identity", "public-network"]
+paths = ["src/engine/**", "templates/sbx-v3/**", "tests/boundary/**"]
 filter = "test(/^sbx::/)"
+budget_seconds = 1800
+serial = true
 group = "docker"
 
 [suites.boundary-conformance]
@@ -684,6 +695,7 @@ filter = "test(/^strategy::/)"
 group = "vm"
 
 [suites.artifact-entrypoints]
+# Includes production SBX admission without test isolation, provider keys or a live CLI.
 tier = "artifact"
 kind = "nextest"
 package = "awman-cli"
@@ -823,6 +835,7 @@ contracts = ["xtask-release-contract"]
 requires = []
 paths = ["xtask/**"]
 
+# Includes changed-on-resume, changed-before-seal and tampered-on-requalification SBX rehearsals.
 [suites.xtask-pipeline]
 tier = "component"
 kind = "nextest"
@@ -1068,6 +1081,10 @@ reduces_only = true
 proof = "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation"
 
 [test_env]
+sbx_home = "AWMAN_TEST_SBX_HOME"
+sbx_identity = "AWMAN_TEST_SBX_IDENTITY"
+sbx_key_file = "AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE"
+sbx_provider_keys_dir = "AWMAN_TEST_SBX_PROVIDER_KEYS_DIR"
 tier = "AWMAN_TEST_TIER"
 fixtures = "AWMAN_TEST_FIXTURES"
 artifact = "AWMAN_TEST_ARTIFACT"
@@ -1143,7 +1160,7 @@ triple = "aarch64-apple-darwin"
 toolchain = "1.94.0"
 image = "pending-provisioned-image-digest"
 trust = "operator"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker-sbx"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker-sbx", "sbx-test-identity", "public-network"]
 
 # Nightly private-registry soak needs separately provisioned credentials; without
 # them the cell reports BLOCKED. Removing the capability blocks this cell.
@@ -1392,3 +1409,24 @@ budget_minutes = 10
 [[gates.nightly-kit.cells]]
 suites = ["kit-relocation"]
 builds = ["linux-x64-default"]
+
+[suites.artifact-sbx-smoke]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-sbx-smoke"]
+requires = ["docker-sbx", "sbx-test-identity", "public-network"]
+paths = ["src/**", "templates/sbx-v3/**", "tests/artifact/sbx_smoke/**"]
+filter = "test(=sbx_smoke::claude_published_workload_ready_and_headless_task) | test(=sbx_smoke::opencode_owned_workload_ready_and_headless_task)"
+budget_seconds = 600
+serial = true
+
+[release.native."native.macos-arm64-sbx"]
+asset = "awman-macos-arm64"
+host = "local"
+suites = ["artifact-sbx-smoke"]
+fixtures = []
+budget_seconds = 1500
+required = false
+

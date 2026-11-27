@@ -1,10 +1,12 @@
 //! Filesystem-resolution for host-global Docker Sandbox (`sbx`) kit
 //! directories.
 //!
-//! sbx kits are host-global (one per agent under `$HOME/.awman/kits/<agent>/`),
+//! v3 kits are host-global (`<home>/kits/v3/<handle>/`),
 //! unlike the per-repo `.awman/Dockerfile.<agent>` files used by the Docker and
 //! Apple runtimes. Resolving these paths is a Layer 0 concern; emitting the kit
-//! contents (rendering `spec.yaml`, copying the startup script) is Layer 1.
+//! contents (descriptor, recipe and build context) is Layer 1. The v3
+//! directory of one agent is selected by the engine's SBX matrix
+//! (`engine::agent::sbx_contract::kit_dir_v3`) under [`SandboxKitPaths::kits_root`].
 
 use std::path::{Path, PathBuf};
 
@@ -39,29 +41,5 @@ impl SandboxKitPaths {
     /// Root directory holding every emitted kit: `<home>/kits`.
     pub fn kits_root(&self) -> PathBuf {
         self.home.join("kits")
-    }
-
-    /// Directory for a single agent's kit: `<home>/kits/<agent>`.
-    pub fn kit_dir(&self, agent: &str) -> PathBuf {
-        self.kits_root().join(agent)
-    }
-
-    /// The rendered kit manifest: `<home>/kits/<agent>/spec.yaml`.
-    pub fn spec_file(&self, agent: &str) -> PathBuf {
-        self.kit_dir(agent).join("spec.yaml")
-    }
-
-    /// The bundled-assets root copied into the VM's `/home/agent/`:
-    /// `<home>/kits/<agent>/files/home`.
-    pub fn files_home_dir(&self, agent: &str) -> PathBuf {
-        self.kit_dir(agent).join("files").join("home")
-    }
-
-    /// The per-launch startup script:
-    /// `<home>/kits/<agent>/files/home/.awman/apply-session-config.sh`.
-    pub fn apply_script_file(&self, agent: &str) -> PathBuf {
-        self.files_home_dir(agent)
-            .join(".awman")
-            .join("apply-session-config.sh")
     }
 }

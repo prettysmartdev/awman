@@ -127,7 +127,7 @@ pub struct ConfigStateSection {
 
 /// `runtime.kind` maturity, stated by `config show` (never in the value).
 pub const RUNTIME_MATURITY_NOTE: &str =
-    "runtime.kind: docker and apple are stable; builtin is experimental; sbx is disabled in v0.14.";
+    "runtime.kind: docker and apple are stable; builtin and sbx are experimental.";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigShowOutcome {

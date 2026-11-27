@@ -425,6 +425,20 @@ pub fn audit(root: &Path, m: &crate::manifest::Manifest, meta: &Metadata) -> Res
             }
         }
     }
+    if m.release
+        .native
+        .contains_key(crate::manifest::release_policy::SBX_NATIVE)
+    {
+        for test in crate::manifest::release_policy::native_tests(
+            crate::manifest::release_policy::SBX_NATIVE,
+        )? {
+            if !all.tests.contains(&test) {
+                all.findings.push(format!(
+                    "required native native.macos-arm64-sbx: missing executable test {test}"
+                ));
+            }
+        }
+    }
     for s in &m.shipped_switch {
         if !all.tests.contains(&s.proof) {
             all.findings.push(format!(

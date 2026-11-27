@@ -1,0 +1,5 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+displayName: awman policy for Codex
+description: Files awman uses to apply and verify per-launch policy

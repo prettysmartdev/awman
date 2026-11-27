@@ -217,3 +217,22 @@ fn the_actual_gate_plan_is_consumed_by_the_release_command() {
         );
     }
 }
+
+#[test]
+fn experimental_sbx_does_not_add_a_provider_kit_or_credentials_to_release() {
+    let doc = yaml(".github/workflows/release.yml");
+    let steps = doc["jobs"]["produce"]["steps"].as_sequence().unwrap();
+    for name in [
+        "Native test kit native.macos-arm64-sbx",
+        "Attest native kit native.macos-arm64-sbx",
+        "Checkpoint native kit native.macos-arm64-sbx",
+    ] {
+        assert!(
+            steps.iter().all(|s| s["name"] != name),
+            "optional SBX diagnostic appeared on the release critical path: {name}"
+        );
+    }
+    let text = read(".github/workflows/release.yml");
+    assert!(!text.contains("test kit-run"));
+    assert!(!text.contains("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE"));
+}

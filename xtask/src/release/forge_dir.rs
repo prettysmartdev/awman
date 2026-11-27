@@ -99,6 +99,12 @@ pub struct NativeScript {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Script {
     #[serde(default)]
+    pub sbx_version: Option<String>,
+    #[serde(default)]
+    pub sbx_change_before_seal: bool,
+    #[serde(default)]
+    pub sbx_label: Option<String>,
+    #[serde(default)]
     pub ci: RunScript,
     #[serde(default)]
     pub builds: BTreeMap<String, RunScript>,
@@ -109,6 +115,8 @@ pub struct Script {
     pub unreachable: Vec<String>,
     #[serde(default)]
     pub mac_unavailable: Option<String>,
+    #[serde(default)]
+    pub sbx_unavailable: Option<String>,
     #[serde(default = "yes")]
     pub confirm: bool,
     #[serde(default)]
@@ -410,7 +418,7 @@ impl DirForge {
         add(s, format!("release-asset-{asset}"), files);
         let plan = plan_for(s, &commit);
         let native = plan["native"].as_array().cloned().unwrap_or_default();
-        if let Some(n) = native.iter().find(|n| n["asset"] == asset.as_str()) {
+        for n in native.iter().filter(|n| n["asset"] == asset.as_str()) {
             let id = n["id"].as_str().unwrap_or("").to_string();
             let kit = fake_kit(n, &plan, &commit, &tree);
             let kit_sha = self.dir.put_blob(&kit);
@@ -418,7 +426,7 @@ impl DirForge {
                 kit_sha.clone(),
                 Attestation {
                     subject_sha256: kit_sha.clone(),
-                    signer_workflow: signer,
+                    signer_workflow: signer.clone(),
                     source_digest: commit.clone(),
                     hosted: true,
                 },
@@ -445,7 +453,14 @@ pub fn fake_kit(native: &Value, plan: &Value, commit: &str, tree: &str) -> Vec<u
     let exe = b"#!/bin/sh\nexit 2\n".to_vec();
     let expected =
         serde_json::to_vec(&fake_inventory(native["tests"].as_array().unwrap())).unwrap();
-    let capabilities = b"{\"schema\":1,\"grants\":[\"hypervisor\",\"offline\"]}".to_vec();
+    let capabilities = if native["id"] == crate::manifest::release_policy::SBX_NATIVE {
+        serde_json::to_vec(
+            &json!({"schema":1,"grants":["docker-sbx","sbx-test-identity","public-network"]}),
+        )
+        .unwrap()
+    } else {
+        b"{\"schema\":1,\"grants\":[\"hypervisor\",\"offline\"]}".to_vec()
+    };
     let mut files = BTreeMap::from([
         ("bin/xtask", exe),
         ("expected.json", expected),
@@ -1312,6 +1327,30 @@ pub struct FakeHosts {
 }
 
 impl Hosts for FakeHosts {
+    fn sbx_qualification(&self) -> Step<super::sbx::Qualification> {
+        let s = self.dir.load();
+        if let Some(code) = s.script.sbx_unavailable {
+            return Err(Stop::new(&code, "isolated SBX prerequisite missing"));
+        }
+        let changed =
+            s.script.sbx_change_before_seal && s.calls.iter().any(|c| c == "sbx-qualification");
+        self.dir.call("sbx-qualification".into());
+        let cli_version = if changed {
+            "0.54.2".into()
+        } else {
+            s.script.sbx_version.unwrap_or_else(|| "0.54.1".into())
+        };
+        let operator_label = s
+            .script
+            .sbx_label
+            .unwrap_or_else(|| "release-test-account".into());
+        Ok(super::sbx::Qualification {
+            inputs_sha256: super::sbx::inputs_digest(&cli_version, &operator_label)?,
+            cli_version,
+            operator_label,
+            cli_sha256: "a".repeat(64),
+        })
+    }
     fn host(&self, plan: &NativePlan, linux_host: Option<&str>) -> Step<Box<dyn NativeHost>> {
         let destination = if plan.host == "ssh" {
             linux_host.map(str::to_string).ok_or_else(|| {
@@ -1344,6 +1383,11 @@ impl NativeHost for FakeHost {
 
     fn probe(&self, plan: &NativePlan) -> Step {
         let s = self.dir.load();
+        if plan.id == crate::manifest::release_policy::SBX_NATIVE {
+            if let Some(code) = s.script.sbx_unavailable {
+                return Err(Stop::new(&code, "isolated SBX prerequisite missing"));
+            }
+        }
         if self.destination == "local" {
             if let Some(why) = s.script.mac_unavailable {
                 return Err(Stop::new("mac-host", why));
@@ -1457,7 +1501,7 @@ impl NativeHost for FakeHost {
         std::fs::write(job.out_dir.join("junit.xml"), xml).map_err(anyhow::Error::from)?;
         std::fs::write(job.out_dir.join("runner.log"), "fake native execution\n")
             .map_err(anyhow::Error::from)?;
-        let body = json!({"schema": 1, "native_id": id, "commit": job.commit, "tree": job.tree,
+        let mut body = json!({"schema": 1, "native_id": id, "commit": job.commit, "tree": job.tree,
             "artifact_sha256": job.asset_sha256, "kit_sha256": job.kit_sha256, "outcome": outcome,
             "reason": script.reason_code.as_ref().map(|c| format!("injected {c}")), "reason_code": script.reason_code,
             "tests": tests, "host": {"os": if job.plan.host == "local" {"macos"} else {"linux"}, "os_build": "fake-1", "arch": if job.plan.host == "local" {"aarch64"} else {"x86_64"}},
@@ -1468,6 +1512,18 @@ impl NativeHost for FakeHost {
             "junit_sha256":sha256_file(&job.out_dir.join("junit.xml"))?,
             "runner_log_sha256":sha256_file(&job.out_dir.join("runner.log"))?,
             "started": world.clock.now().to_rfc3339(), "finished": world.clock.now().to_rfc3339()});
+        if id == crate::manifest::release_policy::SBX_NATIVE && outcome == "passed" {
+            let q = world.hosts.sbx_qualification()?;
+            super::sbx::allocate(&job.out_dir, &job.out_dir)?;
+            let owned: Value = read_json(&job.out_dir.join("sbx-owned.json"))?;
+            for (agent, test, disposition, kit) in crate::manifest::release_policy::SBX_CASES {
+                write_json(
+                    &job.out_dir.join(format!("sbx-smoke.{agent}.json")),
+                    &json!({"schema":1,"test":format!("awman-cli::artifact sbx_smoke::{test}"),"agent":agent,"disposition":disposition,"workload":if *disposition == "owned-workload" { Value::Null } else { json!(agent) },"kit_handle":kit,"kit_digest":"b".repeat(64),"sandbox":owned["cases"].as_array().unwrap().iter().find(|c| c["agent"] == *agent).unwrap()["sandbox"],"sbx_cli":q.cli_version,"inspect_sha256":null,"kits":null,"ready_exit":0,"task_exit":0,"output_bytes":7,"removed":true}),
+                )?;
+            }
+            body["sbx"] = super::sbx::collect(&job.out_dir, &q)?;
+        }
         let result = job.out_dir.join("result.json");
         std::fs::write(&result, serde_json::to_vec_pretty(&body).unwrap())
             .map_err(|e| Stop::new("state-corrupt", e.to_string()))?;

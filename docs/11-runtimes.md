@@ -1,6 +1,6 @@
 # Runtimes
 
-awman v0.14 supports Docker, Apple Containers, and the builtin microVM runtime. The runtime controls how agent processes are isolated from your host machine. These use the same `awman` commands, workflow files, and agent names. The `sbx` configuration value is recognized but disabled for this release.
+awman v0.14 supports Docker, Apple Containers, Docker Sandboxes and the builtin microVM runtime. The runtime controls how agent processes are isolated from your host machine. These use the same `awman` commands, workflow files, and agent names. Docker Sandboxes (`sbx`) and `builtin` are experimental.
 
 Preparation output follows the same rules on every runtime: reusing a ready
 image is quiet, and progress describes work that is needed. Docker and Apple
@@ -17,7 +17,7 @@ Build output is printed without a `running` suffix on every line.
 |---|---|---|---|
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
-| `sbx` | Disabled in v0.14 | No sessions can start | See [issue #86](https://github.com/prettysmartdev/awman/issues/86) |
+| `sbx` | macOS on Apple silicon and Linux x86_64 (experimental) | Docker Sandboxes microVM per workspace and agent | Docker Sandboxes CLI 0.53.0 or newer, signed in. See [Docker Sandboxes](#docker-sandboxes-experimental) |
 | `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` or `awman-linux-amd64` release binary, or a supported source build. No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config (`runtime.kind` is a global-only key):
@@ -556,17 +556,118 @@ These messages apply to configured sources. A stopped or inaccessible source doe
 
 ## Docker Sandboxes (experimental)
 
-The `sbx` runtime is disabled in v0.14 because current Docker Sandboxes kits are
-incompatible with awman's kit definitions. Setting `runtime.kind` to `sbx`
-returns an explicit error before starting an agent. Select `docker`, `apple`,
-or `builtin` to run agents. Existing sandbox state is not deleted.
+**Status: enabled, experimental.** Docker Sandboxes is available on Apple
+silicon macOS and Linux x86_64. Select it in your global configuration:
 
-See [issue #86](https://github.com/prettysmartdev/awman/issues/86) for the
-compatibility work and the plan to restore this runtime.
+```sh
+awman config set runtime.kind sbx
+awman ready --agent claude
+```
+
+Restart an already-running awman process after changing runtimes. Unsupported
+hosts and options fail explicitly; awman never substitutes another runtime.
+
+### Hosts
+
+| Host | Support |
+|---|---|
+| macOS on Apple silicon | Supported |
+| macOS on Intel | Refused: Docker Sandboxes supports macOS on Apple silicon only |
+| Linux x86_64 | Supported |
+| Linux arm64 | Refused: not qualified |
+| Windows | Refused: not qualified |
+
+A refused host gets an explicit error; awman never substitutes another runtime.
+
+### Prerequisites
+
+- The Docker Sandboxes CLI, `sbx`, **0.53.0 or newer** on `PATH`
+  (`brew upgrade docker/tap/sbx` updates it). An older client, or one whose
+  `sbx --version` awman cannot read, is refused with a message naming the
+  version. Newer clients are accepted.
+- You are signed in (`sbx login`). `awman ready` lists sandboxes as its
+  sign-in check and fails with
+  `Docker Sandboxes is not available or you are not signed in (…); run 'sbx login' and retry`.
+- Network access for Docker to fetch the agent workloads.
+
+### Agents
+
+Six agents run on `sbx`; two are refused. Per-agent modes and credentials are in
+[Agent sessions](03-agent-sessions.md#docker-sandboxes-sbx).
+
+| Agent | How it runs |
+|---|---|
+| `claude`, `codex`, `copilot` | Docker's published workload plus an awman kit |
+| `opencode` (1.x), `cline`, `antigravity` | A workload awman defines |
+| `cursor`, `opencode-v2` | Refused: they need per-execution state and credential isolation that a persistent sandbox does not provide |
+| Custom agents | Refused |
+
+`awman ready --agent <name>` checks the matrix, the `sbx` version and sign-in,
+prepares the kit and validates it locally. It does not create a sandbox, pull an
+image or check a provider credential, so a successful `ready` does not mean the
+agent is authenticated.
+
+### How sandboxes are used
+
+One sandbox is kept per workspace and agent (named `awman-<hash>-<agent>`).
+Later launches refuse both running and stopped sandboxes: SBX cannot yet
+exclude sessions started by other clients during policy apply and startup.
+Save guest files and conversations, explicitly remove the sandbox with
+`sbx rm <name>`, then launch again to create a fresh one. Only the Git repository root is
+mounted; awman rechecks its approved path and file identity immediately before
+creation. Before every launch awman applies the session's mode, model, tool
+rules and system prompt inside the sandbox and starts the agent only after that
+succeeded; it writes nothing into your workspace. If another awman session is
+using the sandbox, the launch stops with
+`sandbox '<name>' is already in use by another awman session; wait for it to finish or stop it`.
+
+Context files in the guest home are replaced or removed only when awman
+created them and their contents still match its last write. Personal files
+are preserved when no context is supplied. Supplying context over an existing
+personal file, changing an awman-owned file, or linking a configuration
+directory elsewhere causes policy apply to refuse. Save or move that file
+explicitly before retrying.
+
+### Kit migration and recreating a sandbox
+
+A sandbox made by an older awman, by hand, or from a different kit version
+cannot be reused. awman stops with `sandbox '<name>' cannot be reused: <reason>`
+and **never removes it for you**. To continue:
+
+1. Save anything you need from inside the sandbox. Files in your workspace are
+   on your machine and are kept. Agent conversations, logins and other files in
+   the sandbox's home directory are deleted with it, so finish or copy out any
+   conversation you want to keep, and commit or stash uncommitted work first.
+2. Remove it: `sbx rm <name>`.
+3. Run the command again; awman creates a new sandbox from the current kit.
+
+`awman ready` lists stale sandboxes it finds for the agent. `ready --no-cache`
+additionally lists every awman sandbox for the agent with the removal command;
+it removes nothing.
+
+### Credentials
+
+awman registers a credential for the sandbox only, from an `env(VAR)` overlay
+or the macOS Keychain, and passes the value on standard input, never in the
+command line. Surrounding whitespace is trimmed once; empty tokens and tokens
+with embedded line breaks are refused. It reports that a secret was *registered*, not that the agent is
+authenticated. If awman supplies none and none is stored it warns, names
+`sbx secret set <service> --sandbox <name>`, and continues; the agent's own
+result then decides the outcome. Workloads that awman defines (`opencode`,
+`cline`, `antigravity`) also need Docker to approve their use of the credential
+once: run `sbx run --name <name>` in a terminal if the agent reports missing
+authentication.
 
 ### Known limitations
 
-All SBX agent operations are unavailable in v0.14.
+- Experimental on Apple silicon macOS and Linux x86_64; other hosts are refused.
+- A mode, tool rule, model or agent flag that an agent's route cannot deliver
+  is refused before any `sbx` call rather than ignored (see the agent matrix).
+- `--read-only-workspace`, ACP launch mode, a prompt that starts with `-`,
+  directory overlays and command mounts are refused. `--allow-docker` is
+  refused on `opencode`, `cline` and `antigravity`.
+- `cursor` and `opencode-v2` are refused (no per-execution isolation).
+- awman never deletes a sandbox; removal is always your `sbx rm`.
 
 ---
 
@@ -605,8 +706,8 @@ awman ready
 awman chat --agent claude
 ```
 
-`awman ready` prepares the selected runtime. Selecting `sbx` in v0.14 fails
-with a disabled-runtime error; choose a supported runtime to continue.
+`awman ready` prepares the selected runtime. You can select `sbx` on Apple
+silicon macOS or Linux x86_64 with `awman config set runtime.kind sbx`.
 
 ---
 

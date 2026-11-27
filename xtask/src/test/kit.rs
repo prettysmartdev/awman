@@ -17,6 +17,8 @@ struct BuildArgs {
 #[derive(Parser)]
 struct RunArgs {
     #[arg(long)]
+    native: Option<String>,
+    #[arg(long)]
     kit: PathBuf,
     #[arg(long)]
     artifact: PathBuf,
@@ -206,7 +208,7 @@ pub(super) fn build(root: &Path, args: &[String]) -> Result<ExitCode> {
             .join(format!("cargo-nextest{}", std::env::consts::EXE_SUFFIX)),
     )?;
     std::fs::write(out.join("workspace/Cargo.toml"), "[workspace]\n")?;
-    std::fs::write(out.join("nextest.toml"), format!("nextest-version = \"{}\"\n[profile.default]\nretries = 0\nfail-fast = false\ntest-threads = 1\nslow-timeout = {{ period = \"1s\", terminate-after = {} }}\n[profile.default.junit]\npath = \"junit.xml\"\n", m.tools["nextest"].version, m.tiers["artifact"].budget_seconds.context("artifact deadline")?))?;
+    std::fs::write(out.join("nextest.toml"), format!("nextest-version = \"{}\"\n[profile.default]\nretries = 0\nfail-fast = false\ntest-threads = 1\nslow-timeout = {{ period = \"1s\", terminate-after = {} }}\n[profile.default.junit]\npath = \"junit.xml\"\n", m.tools["nextest"].version, native.suites.iter().map(|id| m.suites[id].budget_seconds.or(m.tiers["artifact"].budget_seconds).unwrap_or(300)).max().context("artifact deadline")?))?;
     // Only the necessary fixture is visible to GuestFixtures. The runtime's
     // logical name remains guest-oci-base; evidence retains its concrete ID.
     let mut config = toml::Table::new();
@@ -288,9 +290,7 @@ pub(super) fn build(root: &Path, args: &[String]) -> Result<ExitCode> {
     )?;
     std::fs::write(
         out.join("capabilities.json"),
-        serde_json::to_vec_pretty(
-            &serde_json::json!({"schema":1,"tier":"artifact","grants":["hypervisor","offline"],"private_home":true,"offline_enforced":"per-child"}),
-        )?,
+        serde_json::to_vec_pretty(&capability_contract(&m, native))?,
     )?;
     let mut contents = BTreeMap::new();
     files(&out, &out, &mut contents)?;
@@ -331,9 +331,15 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
     std::fs::create_dir_all(&a.out)?;
     let started = chrono::Utc::now();
     let mut result = serde_json::json!({"schema":1,"native_id":null,"commit":null,"tree":null,"artifact_sha256":a.artifact_sha256,"kit_sha256":null,"outcome":"blocked","reason":null,"reason_code":"kit-corrupt","tests":[],"host":{"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"os_build":null},"started":started,"finished":null});
+    let mut sbx_check = a.native.as_deref() == Some(crate::manifest::release_policy::SBX_NATIVE);
     let checked = (|| -> Result<()> {
         let root = a.kit.canonicalize()?;
         let kit: Kit = serde_json::from_slice(&std::fs::read(root.join("kit.json"))?)?;
+        sbx_check |= kit.native_id == crate::manifest::release_policy::SBX_NATIVE;
+        ensure!(
+            a.native.as_ref().is_none_or(|id| id == &kit.native_id),
+            "kit-corrupt: runner check differs"
+        );
         let mut actual_files = BTreeMap::new();
         files(&root, &root, &mut actual_files)?;
         actual_files.remove("digests.json");
@@ -356,7 +362,8 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             .into_iter()
             .collect();
         ensure!(
-            kit.tests == expected,
+            kit.tests == expected
+                && kit.filter == crate::manifest::release_policy::native_filter(&kit.native_id)?,
             "kit-corrupt: required selection differs"
         );
         let essential = [
@@ -455,7 +462,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             );
         }
         #[cfg(target_os = "linux")]
-        {
+        if !sbx_check {
             let kvm = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -463,7 +470,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             ensure!(kvm.is_ok(), "no-hypervisor: read/write /dev/kvm required");
         }
         #[cfg(target_os = "macos")]
-        {
+        if !sbx_check {
             let hv = Command::new("/usr/sbin/sysctl")
                 .args(["-n", "kern.hv_support"])
                 .output()?;
@@ -489,6 +496,26 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
                 && String::from_utf8_lossy(&version.stdout).contains(&kit.nextest_version),
             "kit-corrupt: runner version mismatch"
         );
+        let qualification = if sbx_check {
+            Some(crate::release::sbx::probe()?)
+        } else {
+            None
+        };
+        let capabilities: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("capabilities.json"))?)?;
+        let grants: Vec<String> = serde_json::from_value(capabilities["grants"].clone())?;
+        let expected_grants = if sbx_check {
+            vec!["docker-sbx", "sbx-test-identity", "public-network"]
+        } else {
+            vec!["hypervisor", "offline"]
+        };
+        ensure!(
+            grants == expected_grants,
+            "kit-corrupt: invalid native capability grant"
+        );
+        if sbx_check {
+            crate::release::sbx::allocate(&a.out, &a.tmproot)?;
+        }
         let home = tempfile::tempdir_in(&a.tmproot)?;
         let isolation = super::isolation::Run::for_home(home.path().to_owned())?;
         let workspace = home.path().join("workspace");
@@ -531,7 +558,8 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
                 .env("AWMAN_TEST_TIER", "artifact")
                 .env("AWMAN_TEST_TMPROOT", &a.tmproot)
                 .env("AWMAN_TEST_EVIDENCE_DIR", absolute(&a.out)?)
-                .env("AWMAN_TEST_HOST_RESOURCES", "hypervisor,offline");
+                .env("AWMAN_TEST_HOST_RESOURCES", grants.join(","));
+            if sbx_check { crate::release::sbx::grant(&mut command)?; }
             let log = std::fs::File::create(a.out.join("runner.log"))?;
             command.stdout(log.try_clone()?).stderr(log);
             // Its own process group, so the deadline stops every descendant.
@@ -557,7 +585,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
                     );
                     let _ = child.kill();
                     child.wait()?;
-                    anyhow::bail!("timeout: native kit deadline");
+                    return Err(crate::release::error::Stop::new("timeout", "native kit deadline").into());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             };
@@ -581,21 +609,24 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
             ensure!(got == kit.tests, "kit-corrupt: JUnit inventory differs");
             Ok((status, records))
         })();
-        let swept = isolation.finish();
-        let (status, records) = match (ran, swept) {
-            (Ok(ran), Ok(())) => ran,
-            (Err(e), Ok(())) => return Err(e),
-            (Ok(_), Err(leak)) => return Err(leak),
-            // Keep the primary reason (and its blocked code) first.
-            (Err(e), Err(leak)) => anyhow::bail!("{e:#}; {leak:#}"),
+        let cleaned = if sbx_check {
+            crate::release::sbx::cleanup(&a.out, &a.tmproot)
+        } else {
+            Ok(false)
         };
+        let swept = isolation.finish();
+        enforce_cleanup(cleaned, swept)?;
+        let (status, records) = ran?;
         if records.iter().any(|r| r.outcome == Outcome::Blocked) {
-            anyhow::bail!("kit-corrupt: required test reported blocked; inspect runner.log and JUnit for the missing capability");
+            return Err(crate::release::error::Stop::new("native-blocked", "required test reported blocked; inspect runner.log and JUnit for the missing capability").into());
         }
         ensure!(
             status.success() && records.iter().all(|r| r.outcome == Outcome::Passed),
             "native tests failed"
         );
+        if let Some(q) = qualification {
+            result["sbx"] = crate::release::sbx::collect(&a.out, &q)?;
+        }
         Ok(())
     })();
     let code = match checked {
@@ -606,16 +637,7 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
         }
         Err(e) => {
             let reason = format!("{e:#}");
-            let code = [
-                "no-hypervisor",
-                "fixture-digest",
-                "socket-budget",
-                "artifact-digest",
-                "kit-corrupt",
-                "timeout",
-            ]
-            .into_iter()
-            .find(|s| reason.contains(s));
+            let code = blocked_reason(sbx_check, &e);
             result["outcome"] =
                 serde_json::json!(if code.is_some() { "blocked" } else { "failed" });
             result["reason"] = serde_json::json!(reason);
@@ -645,6 +667,68 @@ pub(super) fn run(args: &[String]) -> Result<ExitCode> {
     file.sync_all()?;
     std::fs::rename(tmp, path)?;
     Ok(ExitCode::from(code))
+}
+
+/// Preserve the two offline environment contracts byte-for-byte; derive host grants
+/// from the selected suites rather than granting every native run a hypervisor.
+fn capability_contract(
+    m: &Manifest,
+    native: &crate::manifest::schema::Native,
+) -> serde_json::Value {
+    let grants: Vec<_> = [
+        "hypervisor",
+        "offline",
+        "docker-sbx",
+        "sbx-test-identity",
+        "public-network",
+    ]
+    .into_iter()
+    .filter(|cap| {
+        native
+            .suites
+            .iter()
+            .any(|id| m.suites[id].requires.iter().any(|c| c == cap))
+    })
+    .collect();
+    serde_json::json!({"schema":1,"tier":"artifact","grants":grants,"private_home":true,
+        "offline_enforced":if grants.contains(&"offline") {serde_json::json!("per-child")} else {serde_json::Value::Null}})
+}
+fn enforce_cleanup(cleaned: Result<bool>, swept: Result<()>) -> Result<()> {
+    let leaked =
+        cleaned.map_err(|e| anyhow::anyhow!("SBX cleanup unverified; result void: {e:#}"))?;
+    ensure!(!leaked, "owned SBX sandbox survived its test; result void");
+    swept.map_err(|e| anyhow::anyhow!("owned-process cleanup failed; result void: {e:#}"))
+}
+
+fn blocked_reason(sbx: bool, error: &anyhow::Error) -> Option<&'static str> {
+    let infrastructure = [
+        "timeout",
+        "native-blocked",
+        "no-sbx-cli",
+        "sbx-cli-incompatible",
+        "sbx-identity-missing",
+        "sbx-not-signed-in",
+        "sbx-identity-not-isolated",
+        "sbx-network",
+    ];
+    let legacy = [
+        "no-hypervisor",
+        "fixture-digest",
+        "socket-budget",
+        "artifact-digest",
+        "kit-corrupt",
+    ];
+    if let Some(stop) = error.downcast_ref::<crate::release::error::Stop>() {
+        return infrastructure.into_iter().find(|code| stop.code == *code);
+    }
+    if sbx {
+        return None;
+    }
+    // Existing offline-kit diagnostics retain their prefix contract.
+    let reason = format!("{error:#}");
+    legacy
+        .into_iter()
+        .find(|code| reason.starts_with(&format!("{code}:")))
 }
 
 /// Inspect content-addressed OCI config bytes without extracting host paths.
@@ -693,6 +777,76 @@ fn verify_oci_arch(path: &Path, arch: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_sbx_native_kit_receives_sbx_and_network_grants() {
+        let m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let old = serde_json::json!({"schema":1,"tier":"artifact","grants":["hypervisor","offline"],"private_home":true,"offline_enforced":"per-child"});
+        for id in ["native.macos-arm64", "native.linux-x64"] {
+            assert_eq!(
+                serde_json::to_vec_pretty(&capability_contract(&m, &m.release.native[id])).unwrap(),
+                serde_json::to_vec_pretty(&old).unwrap()
+            );
+        }
+        let sbx = capability_contract(
+            &m,
+            &m.release.native[crate::manifest::release_policy::SBX_NATIVE],
+        );
+        assert_eq!(
+            sbx["grants"],
+            serde_json::json!(["docker-sbx", "sbx-test-identity", "public-network"])
+        );
+        assert!(sbx["offline_enforced"].is_null());
+    }
+    #[test]
+    fn sbx_prerequisites_and_deadlines_block_but_kit_or_product_defects_fail() {
+        for reason in [
+            "no-sbx-cli",
+            "sbx-cli-incompatible",
+            "sbx-identity-missing",
+            "sbx-not-signed-in",
+            "sbx-identity-not-isolated",
+            "sbx-network",
+            "timeout",
+            "native-blocked",
+        ] {
+            assert_eq!(
+                blocked_reason(
+                    true,
+                    &crate::release::error::Stop::new(reason, "prerequisite").into()
+                ),
+                Some(reason)
+            );
+        }
+        for reason in [
+            "kit-corrupt: invalid selection",
+            "artifact-digest: mismatch",
+            "native tests failed",
+            "product timeout in sbx-network diagnostic",
+            "timeout; owned SBX sandbox survived its test",
+            "owned SBX sandbox survived its test; result void",
+        ] {
+            assert_eq!(blocked_reason(true, &anyhow::anyhow!(reason)), None);
+        }
+        assert_eq!(
+            blocked_reason(false, &anyhow::anyhow!("kit-corrupt: missing JUnit")),
+            Some("kit-corrupt")
+        );
+    }
+    #[test]
+    fn cleanup_failure_overrides_even_a_typed_blocked_primary_error() {
+        for result in [
+            enforce_cleanup(Ok(true), Ok(())),
+            enforce_cleanup(
+                Err(crate::release::error::Stop::new("timeout", "cleanup timeout").into()),
+                Ok(()),
+            ),
+            enforce_cleanup(Ok(false), Err(anyhow::anyhow!("descendant leak"))),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(blocked_reason(true, &error), None);
+        }
+    }
+
     #[test]
     fn oci_fixture_architecture_is_checked_from_the_archive_config() {
         let dir = tempfile::tempdir().unwrap();

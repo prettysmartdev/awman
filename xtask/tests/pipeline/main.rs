@@ -474,7 +474,7 @@ fn a_second_clone_is_locked_out_until_an_explicit_takeover() {
     ])
     .passed();
     assert_eq!(w.calls("dispatch "), 5, "the new owner reused every run");
-    assert_eq!(w.calls("native-run"), 2, "and every native result");
+    assert_eq!(w.calls("native-run"), 2, "and every selected native result");
     assert!(w.published().is_some());
 }
 
@@ -556,6 +556,16 @@ fn the_seal_binds_the_exact_assets_and_the_checksums() {
 // ── every layer-1 rehearsal scenario, run through `release rehearse` ──────────
 
 const SCENARIOS: &[&str] = &[
+    "experimental-sbx-does-not-gate-release",
+    "sbx-qualification-changed-on-resume",
+    "sbx-qualification-changed-before-seal",
+    "sbx-retained-proof-tampered-on-requalification",
+    "sbx-pass",
+    "sbx-prerequisite-blocked",
+    "sbx-product-failed",
+    "sbx-kit-blocked",
+    "sbx-interrupted",
+    "sbx-evidence-tampered",
     "clean",
     "clean-reuse",
     "transient-ci",
@@ -672,6 +682,17 @@ macro_rules! scenario_tests {
 }
 
 scenario_tests! {
+    rehearse_experimental_sbx_does_not_gate_release => "experimental-sbx-does-not-gate-release",
+    rehearse_sbx_qualification_changed_on_resume => "sbx-qualification-changed-on-resume",
+    rehearse_sbx_qualification_changed_before_seal => "sbx-qualification-changed-before-seal",
+    rehearse_sbx_retained_proof_tampered_on_requalification => "sbx-retained-proof-tampered-on-requalification",
+    rehearse_sbx_pass => "sbx-pass",
+    rehearse_sbx_prerequisite_blocked => "sbx-prerequisite-blocked",
+    rehearse_sbx_product_failed => "sbx-product-failed",
+    rehearse_sbx_kit_blocked => "sbx-kit-blocked",
+    rehearse_sbx_interrupted => "sbx-interrupted",
+    rehearse_sbx_evidence_tampered => "sbx-evidence-tampered",
+
     rehearse_clean => "clean",
     rehearse_clean_reuse => "clean-reuse",
     rehearse_transient_ci => "transient-ci",

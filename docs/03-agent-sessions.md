@@ -44,7 +44,7 @@ and `cursor` do not offer ACP and refuse it before launch. Other agents use the
 standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
-The `sbx` runtime is disabled in v0.14. The `builtin` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
+The `sbx` runtime refuses ACP launch mode. The `builtin` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
 
 The interactive ACP experience currently ships in the **CLI**. See
 [ACP in the TUI](#acp-in-the-tui) and [Workflows](#workflows-and-unsupported-agents)
@@ -228,7 +228,7 @@ Per-agent translation and expected `<NAME>` format:
 | `opencode-v2` | `--model <NAME>` | `provider/model`, as for `opencode`. Interactive sessions with `--model` use OpenCode 2.x's minimal interface (`opencode mini`); see [OpenCode 1.x and 2.x](#opencode-1x-and-2x) |
 | `cursor` | `--model <NAME>` | model name as listed by `cursor-agent models` |
 | `cline` | `--model <NAME>` | model ID for the selected provider; use `--agent-flag --provider` to select a provider for one run |
-| `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `sbx` runtime (use the `/model` slash command there) |
+| `copilot` | `--model <NAME>` | bare model ID; refused under the `sbx` runtime (use the `/model` slash command there) |
 
 For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
@@ -236,7 +236,7 @@ An agent with no model flag (a custom agent whose definition declares none) refu
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
-The `sbx` runtime is disabled in v0.14; see [Runtimes](11-runtimes.md#docker-sandboxes-experimental).
+The `sbx` runtime has per-agent `--model` support; see [Docker Sandboxes (`sbx`)](#docker-sandboxes-sbx).
 
 ### `--headless` / `-n`
 
@@ -255,7 +255,7 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
-The `sbx` runtime is disabled in v0.14; this flag cannot start an SBX session.
+The `sbx` runtime supports headless execution for its supported agents; see [Docker Sandboxes (`sbx`)](#docker-sandboxes-sbx).
 
 ### `--interactive`
 
@@ -426,7 +426,7 @@ Every agent-launching command (`chat`, `exec prompt`, `exec workflow`, and their
 
 When both `--yolo` and `--auto` are passed, `--yolo` wins. `--plan` together with an explicit `--yolo` or `--auto` is refused (`plan and yolo modes are mutually exclusive`).
 
-Not every agent implements every level. `--plan` on a custom agent with no native plan delivery is refused before launch, so a plan request never silently runs at the agent's default level. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. Docker Sandboxes (`sbx`) is disabled in v0.14.
+Not every agent implements every level. `--plan` on a custom agent with no native plan delivery is refused before launch, so a plan request never silently runs at the agent's default level. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. Docker Sandboxes (`sbx`) is experimental; see its [mode matrix](#docker-sandboxes-sbx).
 
 ### `--plan`
 
@@ -596,6 +596,43 @@ Commands submitted through the API (`POST /v1/worker/commands`) run with `--yolo
 - Cline's `--auto` enables tool auto-approval; its `--yolo` skips confirmations and exits after the turn.
 
 ---
+
+## Docker Sandboxes (`sbx`)
+
+Docker Sandboxes is experimental on macOS arm64 and Linux x86_64. See
+[Runtimes](11-runtimes.md#docker-sandboxes-experimental) for hosts, prerequisites
+and kit recreation. awman refuses, before any `sbx` call, an option the agent's
+route cannot deliver; it never launches with a weaker setting.
+
+| Agent | Mode (`--plan`/`--auto`/`--yolo`) | Tool allow/deny | `--model` | `--agent-flag` | Credential service |
+|---|---|---|---|---|---|
+| `claude` | Supported | Supported | Supported | Refused | `anthropic` |
+| `codex` | Refused | Refused | Supported | Refused | `openai` |
+| `copilot` | Refused | Refused | Refused | Refused | `github` |
+| `opencode` (1.x) | Supported | Refused | Supported | Supported | `anthropic` |
+| `cline` | Supported | Refused | Supported | Supported | `anthropic` |
+| `antigravity` | Supported | Refused | Supported | Supported | `google` |
+| `cursor`, `opencode-v2` | Agent refused | | | | |
+
+- Credentials are registered for the sandbox from `env(VAR)` or the macOS
+  Keychain. A credential-like literal is withheld, never passed. A registered
+  secret is not proof the agent is signed in.
+- System prompts are delivered for every agent except `antigravity`, where they
+  are noted but not applied. Existing personal instruction files are preserved;
+  conflicting or modified context files cause launch to refuse.
+- Running and stopped sandbox reuse is refused until session exclusion is
+  qualified. Save guest state, explicitly remove the sandbox, then recreate it.
+- Prompts must not start with `-`; `--read-only-workspace` and ACP launch mode
+  are refused.
+- `cursor` and `opencode-v2` are refused because they need per-execution state
+  and credential isolation that a persistent sandbox cannot provide. Use
+  `docker`, `apple` or `builtin`.
+
+A refusal reads like:
+
+```
+--yolo cannot be delivered to 'codex' on Docker Sandboxes …; select a container runtime or launch without it
+```
 
 ## Custom agents
 
@@ -991,7 +1028,7 @@ awman has two separate OpenCode agents. They are installed, selected, ready-chec
 
 Existing `--agent opencode` users keep OpenCode 1.x; adding `opencode-v2` never changes which version `opencode` runs. To try 2.x, run `awman chat --agent opencode-v2` (awman offers to download `Dockerfile.opencode-v2` and build it on first use) or `awman init --agent opencode-v2`.
 
-OpenCode readiness now checks the image only and skips the former host authentication ping. OpenCode 1.x retains its direct writable host config/data mounts and its historical `--yolo` no-op. Docker Sandboxes is disabled in v0.14 while kit compatibility is updated.
+OpenCode readiness now checks the image only and skips the former host authentication ping. OpenCode 1.x retains its direct writable host config/data mounts and its historical `--yolo` no-op. Docker Sandboxes uses its own per-agent kit and readiness checks; see [Docker Sandboxes (`sbx`)](#docker-sandboxes-sbx).
 
 OpenCode 2 and Cursor require an explicit `--yolo` to authorize their broad approval modes. API and worker defaults, dynamic mode and squad leaders do not grant this authorization. A launch with only an implied yolo mode is refused; dynamic workflows using these agents need an explicit `--yolo`. Squad evaluation leaders and their workflows currently cannot use these agents with their automatic yolo mode.
 

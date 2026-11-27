@@ -83,6 +83,7 @@ pub trait Prompt {
 /// Creates the host for one native check. Production chooses `LocalHost`
 /// for `host = "local"` and `SshHost` for `host = "ssh"`.
 pub trait Hosts {
+    fn sbx_qualification(&self) -> Step<super::sbx::Qualification>;
     fn host(&self, plan: &NativePlan, linux_host: Option<&str>) -> Step<Box<dyn NativeHost>>;
 }
 

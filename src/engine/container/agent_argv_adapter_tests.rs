@@ -833,7 +833,6 @@ fn cursor_state_is_private_and_rules_stay_in_the_workspace() {
         def.system_prompt_delivery,
         crate::engine::agent::SystemPromptMode::AgentsMd
     );
-    assert!(def.sandbox_auth_note.is_some());
 }
 
 #[test]

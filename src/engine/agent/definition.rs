@@ -206,18 +206,15 @@ pub enum InteractiveSeedDelivery {
     Flag(String),
 }
 
-/// Which Docker Sandbox kit kind awman emits for this agent.
-///
-/// Consulted only by the sbx kit emitter and launcher (`src/engine/sandbox/
-/// dsbx/`); the Docker and Apple runtimes ignore it. `Mixin` extends one of
-/// Docker's published built-in agent templates; `Agent` installs the agent
-/// itself on top of the generic shell template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SbxKitKind {
-    /// Extends a Docker built-in template (`kind: mixin`).
-    Mixin,
-    /// Full agent spec extending the shell template (`kind: agent`).
-    Agent,
+/// Arguments following `--` on `sbx run`. Managed policy never travels here.
+pub struct SbxTailRequest<'a> {
+    pub interactive: bool,
+    pub model: Option<&'a crate::engine::container::options::ModelFlagForm>,
+    pub mode_flags: &'a [String],
+    pub agent_flags: &'a [String],
+    /// (flag, text) from `SandboxOption::SystemPromptInline`.
+    pub system_prompt: Option<(&'a str, &'a str)>,
+    pub seeded_prompt: Option<&'a str>,
 }
 
 /// How an agent starts in its native plan (or read-only) mode on each
@@ -417,10 +414,6 @@ pub struct AgentDefinition {
     pub system_prompt_delivery: SystemPromptMode,
     /// CLI flag for system prompt delivery (e.g. `--append-system-prompt-file`).
     pub system_prompt_flag: Option<String>,
-    /// Which Docker Sandbox kit kind awman emits for this agent. Consulted
-    /// only by the sbx runtime (`src/engine/sandbox/dsbx/`); other runtimes
-    /// ignore it.
-    pub sbx_kit_kind: SbxKitKind,
     /// How the host agent's settings/credential directory is passed into a
     /// container. Consumed by `OverlayEngine::agent_settings_overlays_*`.
     pub settings_mount: SettingsMount,
@@ -456,18 +449,9 @@ pub struct AgentDefinition {
     /// Host env vars passed through when set (a custom definition's
     /// `auth.env`). Empty for every first-party agent.
     pub auth_env: Vec<String>,
-    /// Whether a mixin-kit launch under a sandbox-class runtime can deliver
-    /// plan/yolo/auto as a settings-file permission mode that awman renders
-    /// (claude's `permissions.defaultMode`). `false` means the request is
-    /// reported as an unsupported note instead.
-    pub sandbox_permission_mode_supported: bool,
-    /// Note surfaced when `--model` is requested under a sandbox-class
-    /// runtime and the agent's built-in template has no mixin-safe model
-    /// config. `None` for agents whose model flag survives the sandbox path.
-    pub sandbox_model_note: Option<String>,
     /// Allowlist of provider auth env vars accepted via `env(VAR)` overlays
-    /// for launch-time auto-auth under a sandbox-class runtime. Empty for
-    /// agent-kit agents, which do not participate.
+    /// for launch-time auto-auth under a sandbox-class runtime. An empty list
+    /// requires independently approved sandbox credentials for that agent.
     ///
     /// Each var satisfies two constraints, both verified against the Docker
     /// Sandboxes credentials docs: it maps to an sbx well-known service
@@ -499,8 +483,6 @@ pub struct AgentDefinition {
     pub cli_version: Option<CliMajorRequirement>,
     /// Informational note surfaced once per launch.
     pub launch_note: Option<String>,
-    /// Note surfaced on every sandbox-runtime launch.
-    pub sandbox_auth_note: Option<String>,
 }
 
 /// `key = 'value'` → `key=value`: a TOML-style config assignment with the
@@ -525,6 +507,69 @@ fn normalise_config_assignment(text: &str) -> String {
 }
 
 impl AgentDefinition {
+    /// Reviewed first-party SBX route, including explicit refused dispositions.
+    pub fn sbx_route(&self) -> Option<super::sbx_contract::SbxRoute> {
+        if self.is_custom() {
+            None
+        } else {
+            super::sbx_contract::sbx_route(&self.name)
+        }
+    }
+
+    /// Render only argv deliveries from the SBX matrix. This preserves the
+    /// published workload entrypoint and never repeats its executable.
+    pub fn sbx_launch_tail(&self, request: &SbxTailRequest<'_>) -> Vec<String> {
+        use super::sbx_contract::SbxDelivery;
+        use crate::engine::container::options::ModelFlagForm;
+        let Some(route) = self.sbx_route().filter(|r| r.is_supported()) else {
+            return Vec::new();
+        };
+        let mut args = if route.is_owned_workload() {
+            self.launch_shape(!request.interactive, request.model.is_some(), false)
+                .into_iter()
+                .skip(self.interactive_entrypoint.len())
+                .collect::<Vec<_>>()
+        } else {
+            let mut args = Vec::new();
+            if !request.interactive {
+                args.extend(self.non_interactive_flag.iter().cloned());
+                args.extend(self.headless_only_flags.iter().cloned());
+                args.extend(self.headless_text_flags.iter().cloned());
+            }
+            args
+        };
+        if route.mode == SbxDelivery::Argv {
+            args.extend_from_slice(request.mode_flags);
+        }
+        if route.model == SbxDelivery::Argv {
+            if let Some(model) = request.model {
+                match model {
+                    ModelFlagForm::Argument(name) => args.extend(["--model".into(), name.clone()]),
+                    ModelFlagForm::Shorthand(flag) => args.push(flag.clone()),
+                }
+            }
+        }
+        if route.agent_flags == SbxDelivery::Argv {
+            args.extend_from_slice(request.agent_flags);
+        }
+        if route.system_prompt == SbxDelivery::Argv {
+            if let Some((flag, text)) = request.system_prompt {
+                args.extend([flag.into(), text.into()]);
+            }
+        }
+        if let Some(prompt) = request.seeded_prompt {
+            if request.interactive {
+                if let InteractiveSeedDelivery::Flag(flag) = &self.interactive_seed_delivery {
+                    args.push(flag.clone());
+                }
+            } else {
+                args.extend(self.headless_prompt_flag.iter().cloned());
+            }
+            args.push(prompt.into());
+        }
+        args
+    }
+
     /// `true` for a definition loaded from a custom TOML file.
     pub fn is_custom(&self) -> bool {
         !matches!(self.origin, AgentOrigin::FirstParty)
@@ -580,6 +625,50 @@ impl AgentDefinition {
         }
         if matches!(paradigm, RunParadigm::Sandbox) && self.requires_private_session {
             return Err(EngineError::Config(format!("agent '{}' requires per-execution state and credential isolation unavailable on Docker Sandboxes; select a container runtime", self.name)));
+        }
+        if paradigm == RunParadigm::Sandbox {
+            use super::sbx_contract::{SbxDelivery, SbxDisposition};
+            let route =
+                self.sbx_route()
+                    .ok_or_else(|| EngineError::CustomAgentRuntimeUnsupported {
+                        name: self.name.clone(),
+                        runtime: "Docker Sandboxes".into(),
+                    })?;
+            if let SbxDisposition::Refused { reason } = route.disposition {
+                return Err(EngineError::Config(format!(
+                    "agent '{}' {reason}; select a container runtime",
+                    self.name
+                )));
+            }
+            if run
+                .initial_prompt
+                .as_deref()
+                .is_some_and(|p| p.trim_start().starts_with('-'))
+            {
+                return Err(EngineError::Config("prompts must not start with '-' on Docker Sandboxes; prefix the prompt with a sentence".into()));
+            }
+            if run.model.is_some() && route.model == SbxDelivery::Refused {
+                return Err(self.sbx_option_refusal("--model"));
+            }
+            if run.agent_flags.as_ref().is_some_and(|f| !f.is_empty())
+                && route.agent_flags == SbxDelivery::Refused
+            {
+                return Err(self.sbx_option_refusal("agentFlags"));
+            }
+            for (requested, option) in [
+                (matches!(run.yolo, Some(YoloMode::Enabled)), "--yolo"),
+                (matches!(run.auto, Some(AutoMode::Enabled)), "--auto"),
+            ] {
+                if requested && route.mode == SbxDelivery::Refused {
+                    return Err(self.sbx_option_refusal(option));
+                }
+            }
+            if run.allow_docker && route.is_owned_workload() {
+                return Err(self.sbx_option_refusal("--allow-docker"));
+            }
+            if !run.directory_overlays.is_empty() || !run.command_mounts.is_empty() {
+                return Err(self.sbx_option_refusal("directory overlays or command mounts"));
+            }
         }
         // Until the pinned CLI's end-of-options behaviour has runtime proof,
         // refuse option-shaped prompt operands on both paradigms.
@@ -671,9 +760,10 @@ impl AgentDefinition {
             return PlanRoute::Acp;
         }
         if paradigm == RunParadigm::Sandbox {
-            return match self.sbx_kit_kind {
-                SbxKitKind::Agent => PlanRoute::SandboxAgentKit,
-                SbxKitKind::Mixin => PlanRoute::SandboxMixin,
+            return if self.sbx_route().is_some_and(|r| r.is_owned_workload()) {
+                PlanRoute::SandboxAgentKit
+            } else {
+                PlanRoute::SandboxMixin
             };
         }
         if self.uses_model_fallback(run.non_interactive, run.model.is_some()) {
@@ -760,6 +850,13 @@ impl AgentDefinition {
             PlanRoute::Interactive => stdio(false)?,
             PlanRoute::Headless => stdio(true)?,
             PlanRoute::SandboxAgentKit => {
+                if !self.sbx_route().is_some_and(|r| {
+                    r.is_supported() && r.mode == super::sbx_contract::SbxDelivery::Argv
+                }) {
+                    return Err(refuse(
+                        "the agent has no admitted SBX argv route; select a container runtime",
+                    ));
+                }
                 let delivery = stdio(run.non_interactive)?;
                 if delivery.settings.is_some() {
                     return Err(refuse(
@@ -769,9 +866,11 @@ impl AgentDefinition {
                 delivery
             }
             PlanRoute::SandboxMixin => {
-                if !self.sandbox_permission_mode_supported {
+                if !self.sbx_route().is_some_and(|r| {
+                    r.is_supported() && r.mode == super::sbx_contract::SbxDelivery::ManagedFile
+                }) {
                     return Err(refuse(
-                        "the built-in template's launch command takes no flags and the agent has no settings equivalent awman manages; select a container runtime or launch without --plan",
+                        "the published workload owns its launch arguments and the agent has no awman-managed settings file; select a container runtime or launch without --plan",
                     ));
                 }
                 NativePlanDelivery {
@@ -992,8 +1091,8 @@ impl AgentDefinition {
         parts
     }
 
-    /// Sandbox apply scripts deliver tool permissions only for Claude. Check
-    /// delivery before provisioning, including direct backend option callers.
+    /// Check the matrix's tool delivery before provisioning, including direct
+    /// backend option callers. The current matrix manages Claude tools only.
     pub(crate) fn validate_tool_restrictions(
         &self,
         allowed: &[String],
@@ -1009,11 +1108,12 @@ impl AgentDefinition {
             ),
             (allowed, &self.allowed_tools_flag, ToolRestriction::Allowed),
         ] {
-            // Name-based on purpose: first-party names are reserved (a custom
-            // definition named `claude` is skipped at discovery and rejected
-            // by `awman new agent`), so only the built-in claude matches here.
             if !tools.is_empty()
-                && (flag.is_none() || (paradigm == RunParadigm::Sandbox && self.name != "claude"))
+                && (flag.is_none()
+                    || (paradigm == RunParadigm::Sandbox
+                        && !self
+                            .sbx_route()
+                            .is_some_and(|r| r.tools != super::sbx_contract::SbxDelivery::Refused)))
             {
                 return Err(EngineError::ToolRestrictionFlagMissing { restriction });
             }
@@ -1032,6 +1132,30 @@ impl AgentDefinition {
         run: &super::AgentRunOptions,
         paradigm: RunParadigm,
     ) -> Result<Vec<String>, EngineError> {
+        if paradigm == RunParadigm::Sandbox {
+            use super::sbx_contract::SbxDelivery;
+            let delivery = self
+                .sbx_route()
+                .map(|r| r.mode)
+                .unwrap_or(SbxDelivery::Refused);
+            if delivery == SbxDelivery::Refused {
+                // Retain the typed plan-route refusal for existing callers.
+                self.native_plan_delivery(run, paradigm)?;
+                for (requested, option) in [
+                    (matches!(run.yolo, Some(YoloMode::Enabled)), "--yolo"),
+                    (matches!(run.auto, Some(AutoMode::Enabled)), "--auto"),
+                ] {
+                    if requested {
+                        return Err(self.sbx_option_refusal(option));
+                    }
+                }
+                return Ok(Vec::new());
+            }
+            if delivery == SbxDelivery::ManagedFile {
+                self.native_plan_delivery(run, paradigm)?;
+                return Ok(Vec::new());
+            }
+        }
         let mut flags = Vec::new();
         if matches!(run.yolo, Some(YoloMode::Enabled)) {
             flags.extend(self.yolo_flags.iter().cloned());
@@ -1043,6 +1167,10 @@ impl AgentDefinition {
             flags.extend(delivery.argv);
         }
         Ok(flags)
+    }
+
+    pub(crate) fn sbx_option_refusal(&self, option: &str) -> EngineError {
+        EngineError::Config(format!("{option} cannot be delivered to '{}' on Docker Sandboxes through its reviewed workload and policy route; select a container runtime or launch without it", self.name))
     }
 
     /// The sanctioned host ping's `(binary, argv)` for this agent, with the
@@ -1235,7 +1363,7 @@ mod native_plan_tests {
                 ModelFallbackRefused,
                 RouteRefused,
                 RouteRefused,
-                argv(&["--agent", "plan"]),
+                RouteRefused,
             ),
             (
                 "cursor",
@@ -1243,8 +1371,8 @@ mod native_plan_tests {
                 argv(&["--mode", "plan"]),
                 argv(&["--mode", "plan"]),
                 RouteRefused,
-                argv(&["--mode", "plan"]),
-                argv(&["--mode", "plan"]),
+                RouteRefused,
+                RouteRefused,
             ),
             (
                 "copilot",
@@ -2061,5 +2189,181 @@ impl AgentDefinition {
             return Err(EngineError::Config("--agent-session already selects the conversation; remove provider resume selectors from agent flags".into()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sbx_tests {
+    use super::super::{
+        first_party::first_party,
+        sbx_contract::{SbxDelivery, SBX_AGENTS},
+        AgentRunOptions,
+    };
+    use super::*;
+    use crate::engine::container::options::ModelFlagForm;
+
+    #[test]
+    fn published_workload_tails_preserve_entrypoints_and_deliver_headless_prompts() {
+        let model = ModelFlagForm::Argument("chosen".into());
+        for (agent, interactive, expected) in [
+            ("claude", true, vec!["hello"]),
+            ("claude", false, vec!["--print", "hello"]),
+            ("codex", true, vec!["--model", "chosen", "hello"]),
+            ("codex", false, vec!["exec", "--model", "chosen", "hello"]),
+            ("copilot", true, vec!["-i", "hello"]),
+            ("copilot", false, vec!["-p", "hello"]),
+        ] {
+            let def = first_party(agent).unwrap();
+            let args = def.sbx_launch_tail(&SbxTailRequest {
+                interactive,
+                model: Some(&model),
+                mode_flags: &["forbidden-mode".into()],
+                agent_flags: &["forbidden-extra".into()],
+                system_prompt: Some(("forbidden-context-flag", "context")),
+                seeded_prompt: Some("hello"),
+            });
+            assert_eq!(args, expected, "{agent}, interactive={interactive}");
+        }
+    }
+
+    #[test]
+    fn owned_tails_include_only_matrix_argv_options() {
+        let model = ModelFlagForm::Argument("chosen".into());
+        for (agent, interactive, expected) in [
+            (
+                "opencode",
+                true,
+                vec![
+                    "--agent", "plan", "--model", "chosen", "extra", "--prompt", "hello",
+                ],
+            ),
+            (
+                "opencode",
+                false,
+                vec![
+                    "run", "--agent", "plan", "--model", "chosen", "extra", "hello",
+                ],
+            ),
+            (
+                "cline",
+                true,
+                vec![
+                    "--tui", "--plan", "--model", "chosen", "extra", "--system", "context", "hello",
+                ],
+            ),
+            (
+                "cline",
+                false,
+                vec![
+                    "--plan", "--model", "chosen", "extra", "--system", "context", "hello",
+                ],
+            ),
+            (
+                "antigravity",
+                true,
+                vec![
+                    "--mode",
+                    "plan",
+                    "--model",
+                    "chosen",
+                    "extra",
+                    "--prompt-interactive",
+                    "hello",
+                ],
+            ),
+            (
+                "antigravity",
+                false,
+                vec![
+                    "--print", "--mode", "plan", "--model", "chosen", "extra", "hello",
+                ],
+            ),
+        ] {
+            let def = first_party(agent).unwrap();
+            let run = AgentRunOptions {
+                plan: Some(PlanMode::Enabled),
+                non_interactive: !interactive,
+                ..Default::default()
+            };
+            let args = def.sbx_launch_tail(&SbxTailRequest {
+                interactive,
+                model: Some(&model),
+                mode_flags: &def.mode_flags(&run, RunParadigm::Sandbox).unwrap(),
+                agent_flags: &["extra".into()],
+                system_prompt: Some(("--system", "context")),
+                seeded_prompt: Some("hello"),
+            });
+            assert_eq!(args, expected, "{agent}, interactive={interactive}");
+        }
+    }
+
+    #[test]
+    fn matrix_admission_refuses_private_sessions_unsupported_options_and_option_shaped_prompts() {
+        for agent in SBX_AGENTS {
+            let def = first_party(agent).unwrap();
+            let route = def.sbx_route().unwrap();
+            assert_eq!(
+                def.validate_run(&AgentRunOptions::default(), RunParadigm::Sandbox)
+                    .is_ok(),
+                route.is_supported(),
+                "{agent}"
+            );
+            for interactive in [true, false] {
+                let run = AgentRunOptions {
+                    initial_prompt: Some("  --looks-like-a-flag".into()),
+                    non_interactive: !interactive,
+                    ..Default::default()
+                };
+                assert!(
+                    def.validate_run(&run, RunParadigm::Sandbox).is_err(),
+                    "{agent}"
+                );
+            }
+            for run in [
+                AgentRunOptions {
+                    model: Some("chosen".into()),
+                    ..Default::default()
+                },
+                AgentRunOptions {
+                    agent_flags: Some(vec!["--extra".into()]),
+                    ..Default::default()
+                },
+                AgentRunOptions {
+                    yolo: Some(YoloMode::Enabled),
+                    yolo_authorized: true,
+                    ..Default::default()
+                },
+                AgentRunOptions {
+                    auto: Some(AutoMode::Enabled),
+                    ..Default::default()
+                },
+            ] {
+                let delivery = if run.model.is_some() {
+                    route.model
+                } else if run.agent_flags.is_some() {
+                    route.agent_flags
+                } else {
+                    route.mode
+                };
+                if delivery == SbxDelivery::Refused {
+                    assert!(
+                        def.validate_run(&run, RunParadigm::Sandbox).is_err(),
+                        "{agent}"
+                    );
+                }
+            }
+            if !route.is_supported() {
+                assert!(def
+                    .sbx_launch_tail(&SbxTailRequest {
+                        interactive: true,
+                        model: None,
+                        mode_flags: &[],
+                        agent_flags: &[],
+                        system_prompt: None,
+                        seeded_prompt: Some("hello")
+                    })
+                    .is_empty());
+            }
+        }
     }
 }

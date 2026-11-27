@@ -84,3 +84,40 @@ fn release_plan_is_json_and_invalid_evidence_never_authenticates_itself() {
     assert_eq!(record["outcome"], "failed");
     assert!(record["cells"].as_array().unwrap().is_empty());
 }
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[test]
+fn sbx_validation_retains_a_blocked_proof_on_an_unsupported_host() {
+    let sandbox = sandbox("sbx_validation_retains_a_blocked_proof_on_an_unsupported_host");
+    let out = sandbox.work().join("proofs");
+    let result = sandbox
+        .command(awman_test_support::cargo_bin!("xtask"))
+        .args(["sbx-validation", "run", "--out"])
+        .arg(&out)
+        .run();
+    assert_eq!(result.exit, awman_test_support::Exit::Code(2));
+    let attempts: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(attempts.len(), 1);
+    let proof: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(attempts[0].join("proof.json")).unwrap()).unwrap();
+    assert_eq!(proof["outcome"], "blocked");
+    assert_eq!(proof["steps"], serde_json::json!({}));
+    assert!(proof["error"].as_str().unwrap().contains("Apple silicon"));
+    let verify = sandbox
+        .command(awman_test_support::cargo_bin!("xtask"))
+        .args(["sbx-validation", "verify"])
+        .arg(&attempts[0])
+        .run();
+    assert!(!verify.exit.success());
+    // Fresh attempts cannot accidentally reuse a preceding proof.
+    sandbox
+        .command(awman_test_support::cargo_bin!("xtask"))
+        .args(["sbx-validation", "run", "--out"])
+        .arg(&out)
+        .run();
+    assert_eq!(std::fs::read_dir(out).unwrap().count(), 2);
+    sandbox.finish();
+}

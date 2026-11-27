@@ -62,6 +62,7 @@ and reproduce tests. Locally:
 | `make test-boundary AWMAN_TEST_HOST_RESOURCES=…` | the `boundary` tier against the real engines and services you name | the named resources |
 | `make test-guest` | fetches the pinned guest fixtures, then the `guest` tier | Apple Silicon or KVM, verified payload (`make payloads`), Docker or Apple Containers for the fixtures |
 | `make test-artifact ARTIFACT=/abs/path/awman` | this host's declared release artifact contracts | the executable and offline isolation; macOS also needs HVF and guest fixtures |
+| `make validate-sbx [LINUX_HOST=user@host]` | lightweight experimental SBX smoke on this Mac and optionally Linux over SSH, with a saved report ([details](testing.md#docker-sandboxes-developer-validation)) | sbx >= 0.54, already logged in on each host; no API keys or setup |
 | `make gates` | `cargo xtask gates check`: manifest, generated files, Makefile contract and these documents | none |
 | `make architecture-lint` | the layering lint and `cargo xtask lint hygiene` | none |
 

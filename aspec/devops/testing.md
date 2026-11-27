@@ -68,6 +68,7 @@ implemented as probes in `crates/awman-test-support/src/capability.rs`.
 | `git-transports` | loopback SSH and HTTP Git servers | `git-transports` |
 | `apple-containers` | the Apple Containers service | `apple-containers` |
 | `docker-sbx` | the Docker sandbox CLI | `docker-sbx` |
+| `sbx-test-identity` | a dedicated Docker Sandboxes identity | the host resource plus `AWMAN_TEST_SBX_HOME`, `AWMAN_TEST_SBX_IDENTITY`, `AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE` |
 | `hypervisor` | Hypervisor.framework or KVM | `hypervisor` |
 | `builtin-payload` | the verified builtin payload | `builtin-payload=<dir>` |
 | `guest-fixtures` | pinned guest OCI and Docker-save archives | `AWMAN_TEST_FIXTURES` |
@@ -100,6 +101,31 @@ Real host resources are used only when named. `AWMAN_TEST_HOST_RESOURCES` is a
 comma-separated list: `docker=unix:///var/run/docker.sock,git-transports`.
 Unset means none, so a bare `cargo test` can never touch a real engine, boot a
 guest or reach the network.
+
+**The dedicated SBX identity.** The full provider boundary and release-smoke
+suites require the `sbx-test-identity` capability, never a developer's own
+login. The separate experimental developer diagnostic `make validate-sbx`
+uses the existing logged-in session and runs no provider tasks. The full
+suites need three operator inputs: `AWMAN_TEST_SBX_HOME` (an owned, 0700
+directory used as `HOME`), `AWMAN_TEST_SBX_IDENTITY` (a non-secret account
+label) and `AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE` (an owned, 0600 file). Granting
+it sets only `HOME` for the child; `AWMAN_HOME`, XDG and Git configuration stay
+private, and the key is redacted from any debug output. An optional
+`AWMAN_TEST_SBX_PROVIDER_KEYS_DIR` (a 0700 directory of 0600 files named for the
+variable, such as `OPENAI_API_KEY` or `GH_TOKEN`) lets the boundary suite
+qualify the Codex and Copilot routes; Cline and Antigravity need a credential
+approved in the identity. A route without its credential is BLOCKED.
+
+**BLOCKED versus FAILED.** A missing capability, a host that is not Apple
+silicon macOS, an `sbx` older than 0.54.0 (boundary) or 0.53.0 (release smoke),
+a signed-out identity or an unprovisioned provider credential reports
+`BLOCKED[...]` and is never a pass. A wrong product behavior, a failed or
+skipped test, or a surviving owned sandbox is FAILED. Both the `boundary-sbx`
+suite (`tests/boundary/sbx/`) and the opt-in `artifact-sbx-smoke` suite
+(`tests/artifact/sbx_smoke/`) follow this rule. The latter's
+`native.macos-arm64-sbx` declaration is optional and excluded from the normal
+release plan and every hosted gate. Evidence
+files record the CLI version and identity label, never a key.
 
 ## The support crate: `awman-test-support`
 
@@ -248,7 +274,7 @@ the file only when `INSTA_UPDATE=always` is set and never when `CI` is set.
 Test code reads the environment only through `awman_test_support::runtime_env`
 (`AWMAN_TEST_TIER`, `AWMAN_TEST_FIXTURES`, `AWMAN_TEST_ARTIFACT`,
 `AWMAN_TEST_ARTIFACT_SHA256`, `AWMAN_TEST_RUN_CONFIG`, `AWMAN_TEST_TMPROOT`,
-`AWMAN_TEST_EVIDENCE_DIR`, `AWMAN_TEST_HOST_RESOURCES`, plus `INSTA_UPDATE` and
+`AWMAN_TEST_EVIDENCE_DIR`, `AWMAN_TEST_HOST_RESOURCES`, the SBX identity inputs below, plus `INSTA_UPDATE` and
 `CI`). These are the `[test_env]` table in `ci/gates.toml`. The only other
 `AWMAN_TEST_*` names allowed anywhere are the `[[shipped_switch]]` entries
 (`AWMAN_TEST_ISOLATION`, `AWMAN_TEST_DOCKER`, `AWMAN_TEST_APPLE_CONTAINER`,
@@ -438,8 +464,8 @@ The Actions controller authenticates service run, attempt, job roles and artifac
 
 ## Native validation
 
-Two different native runs exist. They share the guest tier and the same
-isolation rules but have different purposes.
+Required release checks, broad native diagnostics and lightweight experimental
+SBX smoke have different purposes.
 
 ### Required release checks
 
@@ -482,9 +508,8 @@ the pinned runner, fetches and verifies the builtin payload, previous
 executable and architecture-specific fixtures, compiles the native suites,
 captures their expected tests, signs the guest executables on macOS and runs the
 guest, boundary, soak and artifact breadth (see the `native-diagnostic` gate in
-[cicd.md](cicd.md)). It never runs an agent on the host and does not run the
-`sbx` boundary while that runtime is disabled pending
-[issue #86](https://github.com/prettysmartdev/awman/issues/86).
+[cicd.md](cicd.md)). It never runs an agent on the host. This broad diagnostic excludes the SBX
+platform override; use `make validate-sbx` for Docker Sandboxes.
 
 It writes an evidence directory under `target/native-validation/`. Check one
 with `cargo xtask native-validation verify DIR` from a checkout of its exact
@@ -503,3 +528,78 @@ boundaries and Linux replacement coverage. Nothing schedules it. A single run
 measures execution time; it does **not** establish p95 latency or long-term
 flake rate, cannot authorize release publication and does not satisfy the
 release command's separate provenance requirements.
+
+SBX cleanup uses strict complete listings: unknown, ambiguous or partial rows
+fail verification and retain ownership. A selection whose nonpassing tests
+are all BLOCKED returns exit 2; a failure, skip, cleanup leak or unverifiable
+cleanup returns exit 1. SBX boundary policy tests provide deeper live coverage;
+arithmetic output alone does not qualify policy.
+They are not a prerequisite for experimental macOS enablement: a passing
+`make validate-sbx` is sufficient validation for that decision.
+
+### Docker Sandboxes developer validation
+
+```sh
+make validate-sbx
+```
+
+Run from the checkout on an Apple silicon Mac with sbx 0.54 or newer already
+logged in. No API keys, environment exports, separate identity, credential
+bindings or other pre-setup are required. The target reuses the normal SBX
+login and configuration. It does not install or run an agent on the host.
+
+To also validate a remote Linux host, use the same destination variable as
+release:
+
+```sh
+make validate-sbx LINUX_HOST=user@host
+```
+
+An exported `LINUX_HOST` works too. SSH must already connect non-interactively
+to that account, with sbx installed on its PATH and logged in there. No remote
+checkout, Rust toolchain or provider keys are needed. The command runs both
+the local Mac and remote Linux smoke, creates its own remote scratch workspace,
+and retains the Linux receipt and SSH log in the report's `linux/` directory.
+SSH agent forwarding is disabled. Remote failures fail the whole validation;
+an absent or unverifiable Linux result never counts as Linux evidence.
+
+This is a lightweight experimental-runtime diagnostic under grand architecture
+Tenet 4, outside the release critical path. It checks the CLI version and
+current session, creates a randomly named disposable shell sandbox, inspects it,
+checks Linux guest execution and workspace sharing through both exec and run,
+stops it, verifies exec can restart it, then removes it and verifies absence.
+Only its private scratch workspace is shared. Existing sandboxes, credentials
+and login configuration are not modified. Cleanup is attempted on failure too.
+
+The target prints a result and saves summary.txt, proof.json and command logs
+under target/sbx-validation/run-*. Override the report parent with
+SBX_VALIDATION_DIR if desired. It verifies its report automatically; there is
+no separate verification step to perform. For later offline integrity checks,
+`cargo xtask sbx-validation verify DIR` remains available.
+
+The console prints the selected hosts and report path immediately, followed
+by each host's step start and pass/fail messages. Long-running commands print
+elapsed-time updates every ten seconds. Linux step messages are streamed live
+over SSH; full command output is retained in the logs. Without `LINUX_HOST`,
+only the local Mac smoke runs and no SSH connection is attempted. When it is
+provided, the Mac smoke runs first, followed by the Linux smoke; either failure
+fails the command.
+
+Missing host/CLI/sign-in prerequisites report BLOCKED; a failed guest check,
+unverifiable cleanup or surviving sandbox reports FAILED. Both make the Make
+recipe fail. Failed and blocked reports are retained for diagnosis. Success
+means every selected smoke step passed and cleanup was verified.
+
+This proof intentionally covers less than the provider boundary suite: no paid
+model tasks, per-agent authentication, credential-store isolation or effective
+agent-policy qualification are claimed. Those deeper suites keep their existing
+refusals and requirements and remain separately opt-in. A successful
+`make validate-sbx` is sufficient validation to enable experimental SBX on
+the tested platforms: Apple silicon macOS, plus the remote Linux architecture
+when `LINUX_HOST` was set and its smoke passed. No further provider tests,
+image-pinning exercise, credential provisioning or manual qualification are prerequisites for that
+enablement. The accepted Mac/Linux packet has enabled experimental SBX in
+shipping builds for macOS arm64 and Linux x86_64. The developer command adds no
+release gate and makes no automatic source edits. A cheap exact-asset entrypoint
+test verifies normal SBX agent admission without test isolation or provider
+credentials; deeper SBX provider smoke remains opt-in.
