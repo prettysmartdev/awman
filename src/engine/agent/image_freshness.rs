@@ -162,7 +162,7 @@ where
         let Some(installed) = stale_image(&preparer, &tag, &expected, sink) else {
             continue;
         };
-        let text = crate::data::image_inputs::bind_project_base(&bytes, &project_tag, &project_id)
+        let text = crate::data::image_inputs::bind_project_base(&bytes, &project_tag, &project_tag)
             .map_err(EngineError::Config)?;
         let recipes = inputs.data_home.join("image-recipes");
         crate::data::fs::private_files::create_private_dir(&recipes)?;
@@ -351,6 +351,82 @@ mod failure_reason_tests {
         let reason = failure_reason(&long);
         assert_eq!(reason.chars().count(), MAX_REASON_CHARS);
         assert!(!reason.contains('\n'));
+    }
+}
+
+#[cfg(test)]
+mod project_tag_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[tokio::test]
+    async fn ready_and_stale_agent_builds_use_the_local_project_tag() {
+        let s = TestSandbox::for_test(TestCase::component(
+            "engine::agent::image_freshness::project_tag_tests::ready_and_stale_agent_builds_use_the_local_project_tag",
+        ));
+        let root = s.work();
+        std::fs::create_dir_all(root.join(".awman")).unwrap();
+        std::fs::write(root.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        let project_tag = project_image_tag(&root);
+        let agent_file = root.join(".awman/Dockerfile.claude");
+        std::fs::write(&agent_file, format!("FROM {project_tag}\nRUN echo first\n")).unwrap();
+        let env = EnvSnapshot::from_full_env(
+            s.env()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        );
+        let runtime = Arc::new(test_runtime::BuildRuntime::default());
+        let project_inputs = crate::engine::image_prep::project_inputs_from_disk(
+            &root,
+            &root.join("Dockerfile.dev"),
+        )
+        .unwrap()
+        .unwrap();
+        runtime.install(&project_tag, Some(project_inputs.as_str()));
+        let tag = agent_image_tag(&root, "claude");
+        let context = ImageBuildContext {
+            git_root: root.clone(),
+            project_dockerfile: root.join("Dockerfile.dev"),
+            default_agent: "claude".into(),
+        };
+        let data_home = s.root().join("data");
+        let prep = AgentImagePreparer::for_runtime(runtime.clone(), data_home.clone(), context);
+        prep.build_runtime_coordinated(
+            BuildRequest::runtime(&tag, &agent_file, &root, false),
+            &mut crate::engine::image_prep::contracts::Sink::default(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.recipes.lock().unwrap()[0].starts_with(&format!("FROM {project_tag}\n")));
+
+        std::fs::write(
+            &agent_file,
+            format!("FROM {project_tag}\nRUN echo second\n"),
+        )
+        .unwrap();
+        refresh_stale_images(
+            runtime.clone(),
+            &SessionImageInputs {
+                git_root: root.clone(),
+                project_dockerfile: root.join("Dockerfile.dev"),
+                env,
+                data_home,
+            },
+            &["claude".into()],
+            &mut crate::engine::image_prep::contracts::Sink::default(),
+        )
+        .await
+        .unwrap();
+        let recipes = runtime.recipes.lock().unwrap();
+        assert_eq!(recipes.len(), 2);
+        assert!(recipes[1].starts_with(&format!("FROM {project_tag}\n")));
+        s.finish();
     }
 }
 
