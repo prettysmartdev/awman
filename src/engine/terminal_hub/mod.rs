@@ -23,7 +23,7 @@ use crate::data::terminal::{
     TerminalState,
 };
 
-pub use mirror::{RingBuffer, ScreenMirror};
+pub use mirror::{fit_snapshot, RingBuffer, RingReplay, ScreenMirror, REPLAY_TRIM_WINDOW};
 pub use subscription::TerminalSubscription;
 
 use registry::{HubMessage, HubState, TerminalEntry};
@@ -110,6 +110,15 @@ impl Default for TerminalHubConfig {
             scrollback_lines: 0,
         }
     }
+}
+
+/// What a viewer asks for when it subscribes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SubscribeOptions {
+    /// Replay the retained raw output (at most `ring_bytes`) as `History`
+    /// frames before the first snapshot (WI 0105). Lag recovery and
+    /// execution rebinds never replay it.
+    pub history: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -529,6 +538,17 @@ impl TerminalHub {
     /// Snapshot and receiver are captured under the same lock, preventing a
     /// gap or duplicated output between the initial screen and live frames.
     pub fn subscribe(&self, id: &TerminalId) -> Result<TerminalSubscription, TerminalHubError> {
+        self.subscribe_with(id, SubscribeOptions::default())
+    }
+
+    /// [`Self::subscribe`] with options. With `history`, the retained output
+    /// is queued before the snapshot under the same lock, so history,
+    /// snapshot and live output are contiguous and never overlap.
+    pub fn subscribe_with(
+        &self,
+        id: &TerminalId,
+        options: SubscribeOptions,
+    ) -> Result<TerminalSubscription, TerminalHubError> {
         let state = self
             .state
             .lock()
@@ -538,6 +558,7 @@ impl TerminalHub {
             id.clone(),
             entry,
             Arc::downgrade(&self.state),
+            options,
         ))
     }
 

@@ -286,8 +286,161 @@ impl Default for SharedPtySize {
     }
 }
 
+/// Bytes a terminal bridge may queue ahead of its slot's consumer. A bridge
+/// that reaches it stops reading its terminal stream until the consumer
+/// drains, so a stalled viewer is resynchronised by the hub's own
+/// lag-and-snapshot path instead of buffering everything it missed.
+pub const SLOT_OUTPUT_BUDGET: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct SlotOutputQueue {
+    bytes: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+/// The consumer end of a slot's output. Byte-accounted when it came from
+/// [`slot_output_channel`]; a plain receiver converts unaccounted.
+pub struct SlotOutputRx {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    queue: Option<Arc<SlotOutputQueue>>,
+}
+
+impl From<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> for SlotOutputRx {
+    fn from(rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self { rx, queue: None }
+    }
+}
+
+impl SlotOutputRx {
+    fn consumed(&self, bytes: &[u8]) {
+        if let Some(queue) = &self.queue {
+            queue
+                .bytes
+                .fetch_sub(bytes.len(), std::sync::atomic::Ordering::AcqRel);
+            queue.drained.notify_one();
+        }
+    }
+
+    /// Bytes queued and not yet received (0 for an unaccounted channel).
+    pub fn queued(&self) -> usize {
+        self.queue.as_ref().map_or(0, |queue| {
+            queue.bytes.load(std::sync::atomic::Ordering::Acquire)
+        })
+    }
+
+    pub fn try_recv(&mut self) -> Result<Vec<u8>, tokio::sync::mpsc::error::TryRecvError> {
+        let bytes = self.rx.try_recv()?;
+        self.consumed(&bytes);
+        Ok(bytes)
+    }
+
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        let bytes = self.rx.recv().await?;
+        self.consumed(&bytes);
+        Some(bytes)
+    }
+
+    pub fn blocking_recv(&mut self) -> Option<Vec<u8>> {
+        let bytes = self.rx.blocking_recv()?;
+        self.consumed(&bytes);
+        Some(bytes)
+    }
+
+    /// A plain receiver for a lower layer (the terminal hub bridge). An
+    /// accounted channel is drained by a forwarder so its sender's budget
+    /// keeps moving; an unaccounted one is returned as is.
+    pub fn into_unbounded(mut self) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        if self.queue.is_none() {
+            return self.rx;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    while let Some(bytes) = self.recv().await {
+                        if tx.send(bytes).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                let _ = std::thread::Builder::new()
+                    .name("awman-slot-forward".into())
+                    .spawn(move || {
+                        while let Some(bytes) = self.blocking_recv() {
+                            if tx.send(bytes).is_err() {
+                                return;
+                            }
+                        }
+                    });
+            }
+        }
+        rx
+    }
+}
+
+/// The producer end of a byte-accounted slot output.
+#[derive(Clone)]
+pub struct SlotOutputTx {
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    queue: Arc<SlotOutputQueue>,
+}
+
+impl SlotOutputTx {
+    /// Queue `bytes`. Never refuses for capacity: callers that can apply
+    /// backpressure check [`Self::over_budget`] before reading more.
+    pub fn send(&self, bytes: Vec<u8>) -> Result<(), tokio::sync::mpsc::error::SendError<Vec<u8>>> {
+        let len = bytes.len();
+        self.queue
+            .bytes
+            .fetch_add(len, std::sync::atomic::Ordering::AcqRel);
+        self.tx.send(bytes).inspect_err(|_| {
+            self.queue
+                .bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::AcqRel);
+        })
+    }
+
+    /// Bytes sent and not yet received.
+    pub fn queued(&self) -> usize {
+        self.queue.bytes.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn over_budget(&self) -> bool {
+        self.queued() >= SLOT_OUTPUT_BUDGET
+    }
+
+    /// Resolves once the queue is below [`SLOT_OUTPUT_BUDGET`] (or the
+    /// consumer is gone). Cancel-safe.
+    pub async fn drained(&self) {
+        while self.over_budget() && !self.tx.is_closed() {
+            tokio::select! {
+                _ = self.queue.drained.notified() => {}
+                _ = self.tx.closed() => return,
+            }
+        }
+    }
+}
+
+/// A byte-accounted slot output channel (see [`SLOT_OUTPUT_BUDGET`]).
+pub fn slot_output_channel() -> (SlotOutputTx, SlotOutputRx) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let queue = Arc::new(SlotOutputQueue::default());
+    (
+        SlotOutputTx {
+            tx,
+            queue: queue.clone(),
+        },
+        SlotOutputRx {
+            rx,
+            queue: Some(queue),
+        },
+    )
+}
+
 pub struct ContainerSlotIo {
-    pub stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pub stdout_rx: SlotOutputRx,
     pub stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     pub resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
 }
@@ -642,6 +795,14 @@ impl SquadAttachSession {
             .ok()
             .and_then(|current| current.as_ref().map(|(_, task, _)| task.clone()))
     }
+
+    pub fn current_generation(&self) -> Option<u64> {
+        self.current.lock().ok()?.as_ref().map(|(id, _, _)| *id)
+    }
+
+    pub fn is_current(&self, generation: u64) -> bool {
+        self.current_generation() == Some(generation)
+    }
 }
 
 /// A command owns only this generation. Cleanup also runs when dispatch
@@ -651,6 +812,9 @@ pub struct AttachSessionLease {
     id: u64,
 }
 impl AttachSessionLease {
+    pub fn adopt(session: Arc<SquadAttachSession>, id: u64) -> Self {
+        Self { session, id }
+    }
     pub fn begin(session: Arc<SquadAttachSession>, task: &str, cancel: CancellationToken) -> Self {
         let id = session.begin_command(task, cancel);
         Self { session, id }
@@ -668,6 +832,7 @@ impl Drop for AttachSessionLease {
 pub struct SharedSquadAttach {
     pub session: Arc<SquadAttachSession>,
     pub daemon_reachable: Arc<AtomicBool>,
+    pub generation: Option<u64>,
 }
 
 // ─── Workflow view projection ─────────────────────────────────────────────

@@ -173,7 +173,9 @@ impl AgentImagePreparer {
         if !build.force && matches!(fresh, ImageFreshness::Fresh(_)) {
             return Ok(ImageBuildOutcome::Reused);
         }
-        let request = build.request.with_inputs(&build.inputs, &build.repo);
+        let mut request = build.request.with_inputs(&build.inputs, &build.repo);
+        // The builder process dies with the preparation (run cancel, drop).
+        request.cancel = self.cancel.clone();
         sink.build_started(&tag);
         let result = super::bridge::stream(
             self.cancel.clone(),
@@ -491,7 +493,16 @@ pub(crate) fn label_build(
                 "project image {project_tag} is unavailable for agent input hashing"
             ))
         })?;
-        crate::data::image_inputs::agent_inputs_hash(&bytes, &project_id)
+        crate::data::image_inputs::agent_inputs_hash_at(
+            &bytes,
+            &project_id,
+            &crate::data::image_inputs::DirBuildContext::new(&request.context),
+            &request
+                .dockerfile
+                .strip_prefix(&request.context)
+                .unwrap_or(&request.dockerfile)
+                .to_string_lossy(),
+        )
     } else {
         crate::data::image_inputs::project_inputs_at(
             bytes.as_deref(),

@@ -1299,6 +1299,13 @@ pub const ROUTES: &[RouteSpec] = &[
         capability: None,
     },
     RouteSpec {
+        method: "GET",
+        path: "/v1/squad/tasks/{id}/runs/{run_id}/workflow",
+        op: Operation::SquadRunsWorkflow,
+        local_only: false,
+        capability: None,
+    },
+    RouteSpec {
         method: "POST",
         path: "/v1/squad/tasks/{id}/runs",
         op: Operation::SquadRunsCreate,
@@ -2719,6 +2726,14 @@ async fn resource_handler(
             }
         };
     }
+    macro_rules! run_id {
+        () => {
+            match RunId::parse(params.get("run_id").map(String::as_str).unwrap_or("")) {
+                Ok(id) => id,
+                Err(_) => return ApiError::not_found("resource not found").into_response(),
+            }
+        };
+    }
     macro_rules! decode {
         ($ty:ty) => {
             match serde_json::from_slice::<$ty>(&body) {
@@ -2861,6 +2876,15 @@ async fn resource_handler(
             .into_response(),
             Err(e) => squad_error(e),
         },
+        Operation::SquadRunsWorkflow => {
+            match squad::runs_workflow(&api, &task_id!(), &run_id!()).await {
+                Ok(workflow) => Json(workflow).into_response(),
+                Err(squad::SquadError::TaskNotFound | squad::SquadError::RunNotFound) => {
+                    ApiError::not_found("resource not found").into_response()
+                }
+                Err(error) => squad_error(error),
+            }
+        }
         Operation::SquadRunsCreate => match squad::runs_create(&api, &task_id!()).await {
             Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
             Err(e) => squad_error(e),

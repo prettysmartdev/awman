@@ -32,7 +32,9 @@ impl ExecWorkflowCommand {
     pub(super) fn prerequisite_flow(&self, origin: PrerequisiteOrigin) -> WorkflowPrerequisiteFlow {
         let phase_image = resolve_phase_image(
             &self.session,
-            self.session.git_root(),
+            self.image_root
+                .as_deref()
+                .unwrap_or(self.session.git_root()),
             self.engines.runtime.capabilities().image_acquisition,
         );
         let mut options = WorkflowPrerequisiteFlowOptions::for_session(

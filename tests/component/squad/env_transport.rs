@@ -37,6 +37,7 @@ async fn child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            last_run_phase: None,
             unmet_env: vec![],
             prerequisites: None,
         })

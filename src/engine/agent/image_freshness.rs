@@ -28,7 +28,7 @@ use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::execution_event::{ImageStaleWarning, StaleImageKind};
 use crate::data::image_build_lock::BuildStoreKey;
-use crate::data::image_inputs::{agent_inputs_hash, InputsHash, INPUTS_LABEL};
+use crate::data::image_inputs::{InputsHash, INPUTS_LABEL};
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
@@ -67,6 +67,33 @@ impl SessionImageInputs {
             data_home: crate::data::fs::data_paths::data_home(config.env())?,
         })
     }
+
+    /// Inputs rooted at an explicit image root with an explicit project
+    /// Dockerfile. A squad directory task builds from its task-owned image
+    /// context (WI 0105), whatever `runtime.dockerfile` says and wherever its
+    /// working tree is mounted from.
+    pub fn at(
+        image_root: &Path,
+        project_dockerfile: &Path,
+        env: &EnvSnapshot,
+    ) -> Result<Self, EngineError> {
+        Ok(Self {
+            git_root: image_root.to_path_buf(),
+            project_dockerfile: project_dockerfile.to_path_buf(),
+            env: env.clone(),
+            data_home: crate::data::fs::data_paths::data_home(env)?,
+        })
+    }
+}
+
+/// What a freshness pass does with an image that is not installed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingImages {
+    /// Leave it to the caller's own missing-image path (the WI 0163 refresh).
+    Skip,
+    /// Build it under the same lease and labels as a refresh. There is no
+    /// installed image to fall back to, so a failed build is an error.
+    Build,
 }
 
 /// What one refresh did. Warnings have already been reported to the sink.
@@ -89,6 +116,26 @@ pub async fn refresh_stale_images<S>(
     runtime: Arc<dyn AgentRuntimeEngine>,
     inputs: &SessionImageInputs,
     agents: &[String],
+    sink: &mut S,
+) -> Result<StaleImageRefresh, EngineError>
+where
+    S: ImagePreparationSink + ?Sized,
+{
+    prepare_session_images(runtime, inputs, agents, MissingImages::Skip, sink).await
+}
+
+/// [`refresh_stale_images`], optionally also building images that are not
+/// installed ([`MissingImages::Build`]). One decision rule for every image:
+/// a label matching the inputs is reused, a stale or unlabeled image is
+/// rebuilt with the warn-and-keep fallback, and a missing one is built (or
+/// skipped). The project image is decided before the agents, whose hash
+/// covers the project image id actually installed afterwards, so a changed
+/// base refreshes every dependent agent and an unchanged one reuses them.
+pub async fn prepare_session_images<S>(
+    runtime: Arc<dyn AgentRuntimeEngine>,
+    inputs: &SessionImageInputs,
+    agents: &[String],
+    missing: MissingImages,
     sink: &mut S,
 ) -> Result<StaleImageRefresh, EngineError>
 where
@@ -117,7 +164,14 @@ where
     if let Some(expected) =
         crate::engine::image_prep::project_inputs_from_disk(root, &inputs.project_dockerfile)?
     {
-        if let Some(installed) = stale_image(&preparer, &project_tag, &expected, sink) {
+        if let Some(installed) = image_decision(
+            &preparer,
+            runtime.as_ref(),
+            &project_tag,
+            &expected,
+            missing,
+            sink,
+        )? {
             let request =
                 BuildRequest::runtime(&project_tag, &inputs.project_dockerfile, root, false);
             rebuild(
@@ -139,6 +193,11 @@ where
             )
             .await?;
         }
+    } else if missing == MissingImages::Build {
+        return Err(EngineError::Other(format!(
+            "no project Dockerfile at {}; cannot build {project_tag}",
+            inputs.project_dockerfile.display()
+        )));
     }
 
     let paths = RepoDockerfilePaths::new(root);
@@ -152,14 +211,20 @@ where
         let project_id = match runtime.inspect_image(&project_tag) {
             Ok(Some(image)) => image.id,
             Ok(None) => break,
+            Err(error) if missing == MissingImages::Build => {
+                return Err(unverifiable(&project_tag, &error))
+            }
             Err(error) => {
                 skip_unreadable(&project_tag, &error, sink);
                 break;
             }
         };
         let tag = agent_image_tag(root, agent);
-        let expected = agent_inputs_hash(&bytes, &project_id);
-        let Some(installed) = stale_image(&preparer, &tag, &expected, sink) else {
+        let expected =
+            crate::data::image_inputs::agent_inputs_hash_in(root, agent, &bytes, &project_id);
+        let Some(installed) =
+            image_decision(&preparer, runtime.as_ref(), &tag, &expected, missing, sink)?
+        else {
             continue;
         };
         let text = crate::data::image_inputs::bind_project_base(&bytes, &project_tag, &project_id)
@@ -169,6 +234,10 @@ where
         let pinned =
             tempfile::NamedTempFile::new_in(&recipes).map_err(|e| EngineError::io(&recipes, e))?;
         std::fs::write(pinned.path(), text).map_err(|e| EngineError::io(pinned.path(), e))?;
+        // Docker reads a recipe-specific ignore policy only beside the recipe
+        // it builds (`<recipe>.dockerignore`), and it takes precedence over the
+        // context root's. Keep the agent recipe's policy for the pinned copy.
+        let _ignore = pin_recipe_ignore(root, agent, pinned.path())?;
         let request = BuildRequest::runtime(&tag, pinned.path(), root, false);
         rebuild(
             &preparer,
@@ -192,6 +261,46 @@ where
     Ok(refresh)
 }
 
+/// Removes the pinned recipe's ignore file when the build is done.
+struct PinnedIgnore(std::path::PathBuf);
+
+impl Drop for PinnedIgnore {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Copy `.awman/Dockerfile.<agent>.dockerignore` (read without following a
+/// link) beside the pinned recipe as `<pinned>.dockerignore`, so the build
+/// applies the same policy as a build of the recipe itself.
+fn pin_recipe_ignore(
+    root: &std::path::Path,
+    agent: &str,
+    pinned: &std::path::Path,
+) -> Result<Option<PinnedIgnore>, EngineError> {
+    use crate::data::image_inputs::{BuildContext, ContextEntry, DirBuildContext};
+    let context = DirBuildContext::new(root);
+    let rel = format!(".awman/Dockerfile.{agent}.dockerignore");
+    match context.kind(&rel) {
+        ContextEntry::File => {}
+        ContextEntry::Missing => return Ok(None),
+        _ => {
+            return Err(EngineError::Config(format!(
+                "{} must be a regular file",
+                root.join(&rel).display()
+            )))
+        }
+    }
+    let bytes = context
+        .read(&rel)
+        .map_err(|e| EngineError::io(root.join(&rel), e))?;
+    let mut target = pinned.as_os_str().to_owned();
+    target.push(".dockerignore");
+    let target = std::path::PathBuf::from(target);
+    std::fs::write(&target, bytes).map_err(|e| EngineError::io(&target, e))?;
+    Ok(Some(PinnedIgnore(target)))
+}
+
 /// The build-lease key for a build into the runtime's own image store, so
 /// concurrent session setups against one store share a single build.
 pub fn runtime_build_store(runtime: &dyn AgentRuntimeEngine, env: &EnvSnapshot) -> BuildStoreKey {
@@ -205,8 +314,59 @@ pub fn runtime_build_store(runtime: &dyn AgentRuntimeEngine, env: &EnvSnapshot) 
 struct StaleTarget {
     kind: StaleImageKind,
     agent: Option<String>,
-    /// The kept image's inputs label (`None` when unlabeled).
-    installed: Option<String>,
+    installed: Installed,
+}
+
+/// What is installed under a tag that is about to be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Installed {
+    /// A stale or unlabeled image (its inputs label, if any) that a failed
+    /// rebuild keeps.
+    Kept(Option<String>),
+    /// Nothing: a failed build has no image to fall back to.
+    Nothing,
+}
+
+/// `Some(what is installed)` when `tag` must be built: stale or unlabeled,
+/// or missing under [`MissingImages::Build`]. `None` reuses (or skips) it.
+fn image_decision<S: ImagePreparationSink + ?Sized>(
+    preparer: &AgentImagePreparer,
+    runtime: &dyn AgentRuntimeEngine,
+    tag: &str,
+    expected: &InputsHash,
+    missing: MissingImages,
+    sink: &mut S,
+) -> Result<Option<Installed>, EngineError> {
+    if missing == MissingImages::Build {
+        match preparer.freshness(tag, expected) {
+            Ok(ImageFreshness::Missing) => return Ok(Some(Installed::Nothing)),
+            // A runtime that cannot report metadata still answers existence.
+            Err(error) if metadata_unsupported(&error) => match runtime.image_exists(tag) {
+                Ok(false) => return Ok(Some(Installed::Nothing)),
+                Ok(true) => {}
+                Err(error) => return Err(unverifiable(tag, &error)),
+            },
+            // Preparing a run must establish what it runs: an unreadable
+            // image is neither fresh nor safely reusable.
+            Err(error) => return Err(unverifiable(tag, &error)),
+            Ok(_) => {}
+        }
+    }
+    Ok(stale_image(preparer, tag, expected, sink).map(Installed::Kept))
+}
+
+fn metadata_unsupported(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::UnsupportedOnRuntime { .. } | EngineError::NotImplemented(_)
+    )
+}
+
+fn unverifiable(tag: &str, error: &EngineError) -> EngineError {
+    EngineError::Other(format!(
+        "could not verify image {tag} for this run ({error}); \
+         check that the container runtime is reachable and try again"
+    ))
 }
 
 /// `Some(installed label)` when `tag` is installed but stale or unlabeled.
@@ -276,7 +436,23 @@ async fn rebuild<S: ImagePreparationSink + ?Sized>(
         Ok(ImageBuildOutcome::Reused) => Ok(()),
         // Cancellation is not a build failure to warn about.
         Err(error @ EngineError::ImageAcquisitionCancelled) => Err(error),
+        Err(error) if target.installed == Installed::Nothing => {
+            let what = match target.kind {
+                StaleImageKind::Project => format!("project image {tag}"),
+                StaleImageKind::Agent => format!(
+                    "agent image {tag} for '{}'",
+                    target.agent.as_deref().unwrap_or_default()
+                ),
+            };
+            Err(EngineError::Other(format!(
+                "failed to build {what}: {}",
+                failure_reason(&error)
+            )))
+        }
         Err(error) => {
+            let Installed::Kept(installed) = target.installed else {
+                unreachable!("a missing image is handled by the arm above")
+            };
             let build = match target.kind {
                 StaleImageKind::Project => format!("build project image {tag}"),
                 StaleImageKind::Agent => format!(
@@ -290,7 +466,7 @@ async fn rebuild<S: ImagePreparationSink + ?Sized>(
                 kind: target.kind,
                 agent: target.agent,
                 expected_inputs: expected.as_str().to_string(),
-                installed_inputs: target.installed,
+                installed_inputs: installed,
                 reason: failure_reason(&error),
             };
             sink.report_image_stale(&warning);
@@ -375,6 +551,9 @@ pub(crate) mod test_runtime {
         pub images: Mutex<HashMap<String, ImageMetadata>>,
         pub builds: Mutex<Vec<String>>,
         pub recipes: Mutex<Vec<String>>,
+        /// The recipe-specific ignore policy beside each built recipe, as
+        /// Docker would read it (`<recipe>.dockerignore`).
+        pub recipe_ignores: Mutex<Vec<Option<String>>>,
         pub inspection_error: Mutex<Option<String>>,
         /// Tags whose builds exit non-zero.
         pub failing: Mutex<HashSet<String>>,
@@ -505,6 +684,12 @@ pub(crate) mod test_runtime {
                 .lock()
                 .unwrap()
                 .push(std::fs::read_to_string(&request.dockerfile).unwrap());
+            let mut ignore = request.dockerfile.as_os_str().to_owned();
+            ignore.push(".dockerignore");
+            self.recipe_ignores
+                .lock()
+                .unwrap()
+                .push(std::fs::read_to_string(ignore).ok());
             self.builds.lock().unwrap().push(request.reference.clone());
             on_line("builder stdout");
             if self.hold.load(Ordering::SeqCst) {
@@ -568,5 +753,182 @@ pub(crate) mod test_runtime {
         fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
             panic!("no agents")
         }
+    }
+}
+
+/// Input-change decisions of [`prepare_session_images`] with
+/// [`MissingImages::Build`] (WI 0105): what is rebuilt, reused, kept or
+/// fatal. A private directory and the in-process builder; no daemon.
+#[cfg(test)]
+mod prepare_tests {
+    use super::test_runtime::BuildRuntime;
+    use super::*;
+    use crate::engine::image_prep::contracts::Sink;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    struct Case {
+        _sandbox: TestSandbox,
+        root: PathBuf,
+        runtime: Arc<BuildRuntime>,
+        inputs: SessionImageInputs,
+    }
+
+    fn case(id: &'static str) -> Case {
+        let sandbox = TestSandbox::for_test(TestCase::component(id));
+        let root = sandbox.work().join("context");
+        std::fs::create_dir_all(root.join(".awman")).unwrap();
+        std::fs::write(root.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join(".awman/Dockerfile.a"), "FROM awman-x\nRUN a\n").unwrap();
+        std::fs::write(root.join(".awman/Dockerfile.b"), "FROM awman-x\nRUN b\n").unwrap();
+        let env = EnvSnapshot::from_full_env(
+            [(
+                "AWMAN_HOME".to_string(),
+                sandbox.root().join("home").display().to_string(),
+            )]
+            .into(),
+        );
+        let inputs = SessionImageInputs {
+            git_root: root.clone(),
+            project_dockerfile: root.join("Dockerfile.dev"),
+            env,
+            data_home: sandbox.root().join("data"),
+        };
+        Case {
+            _sandbox: sandbox,
+            root,
+            runtime: Arc::new(BuildRuntime::default()),
+            inputs,
+        }
+    }
+
+    impl Case {
+        async fn prepare(&self) -> Result<StaleImageRefresh, EngineError> {
+            self.runtime.builds.lock().unwrap().clear();
+            prepare_session_images(
+                self.runtime.clone(),
+                &self.inputs,
+                &["a".into(), "b".into()],
+                MissingImages::Build,
+                &mut Sink(vec![]),
+            )
+            .await
+        }
+        fn tags(&self) -> (String, String, String) {
+            (
+                project_image_tag(&self.root),
+                agent_image_tag(&self.root, "a"),
+                agent_image_tag(&self.root, "b"),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_then_unchanged_then_each_input_change() {
+        let c = case("engine::agent::image_freshness::prepare_tests::decisions");
+        let (project, a, b) = c.tags();
+        c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), [project.clone(), a.clone(), b.clone()]);
+        // Unchanged inputs reuse everything.
+        assert!(c.prepare().await.unwrap().rebuilt.is_empty());
+        assert!(c.runtime.built().is_empty());
+        // One agent recipe: only that agent.
+        std::fs::write(c.root.join(".awman/Dockerfile.b"), "FROM awman-x\nRUN b2\n").unwrap();
+        c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), std::slice::from_ref(&b));
+        // The base: the base and every dependent agent.
+        std::fs::write(c.root.join("Dockerfile.dev"), "FROM scratch\nRUN x\n").unwrap();
+        c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), [project.clone(), a.clone(), b.clone()]);
+        // An unlabeled image (an older awman's) is rebuilt.
+        c.runtime.install(&a, None);
+        c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), std::slice::from_ref(&a));
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_keeps_the_old_id_and_missing_failure_is_fatal() {
+        let c = case("engine::agent::image_freshness::prepare_tests::failures");
+        let (project, a, _) = c.tags();
+        c.prepare().await.unwrap();
+        let old = c.runtime.id(&project).unwrap();
+        c.runtime.fail(&project, true);
+        std::fs::write(c.root.join("Dockerfile.dev"), "FROM scratch\nRUN false\n").unwrap();
+        let refresh = c.prepare().await.unwrap();
+        assert_eq!(refresh.warnings.len(), 1);
+        assert_eq!(refresh.warnings[0].image, project);
+        assert_eq!(c.runtime.id(&project).unwrap(), old);
+        // Agents stay keyed on the kept base, so they are reused.
+        assert!(!refresh.rebuilt.contains(&a));
+
+        c.runtime.images.lock().unwrap().remove(&project);
+        let error = c.prepare().await.unwrap_err().to_string();
+        assert!(error.contains("failed to build project image"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_only_copy_input_edit_rebuilds_that_agent() {
+        let c = case("engine::agent::image_freshness::prepare_tests::agent_copy_input");
+        let (_, a, _) = c.tags();
+        std::fs::write(
+            c.root.join(".awman/Dockerfile.a"),
+            "FROM awman-x\nCOPY tool /tool\n",
+        )
+        .unwrap();
+        std::fs::write(c.root.join("tool"), "v1").unwrap();
+        c.prepare().await.unwrap();
+        assert!(c.prepare().await.unwrap().rebuilt.is_empty());
+        // Only the agent's own input changes; the base is untouched.
+        std::fs::write(c.root.join("tool"), "v2").unwrap();
+        let refresh = c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), std::slice::from_ref(&a));
+        assert!(refresh.warnings.is_empty());
+        // So does its recipe-specific ignore policy.
+        std::fs::write(c.root.join(".awman/Dockerfile.a.dockerignore"), "tool\n").unwrap();
+        c.prepare().await.unwrap();
+        assert_eq!(c.runtime.built(), std::slice::from_ref(&a));
+    }
+
+    #[tokio::test]
+    async fn the_pinned_agent_recipe_keeps_its_recipe_specific_ignore_policy() {
+        let c = case("engine::agent::image_freshness::prepare_tests::pinned_ignore");
+        std::fs::write(
+            c.root.join(".awman/Dockerfile.a"),
+            "FROM awman-x\nCOPY payload /payload\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(c.root.join("payload")).unwrap();
+        std::fs::write(c.root.join("payload/private.txt"), "secret").unwrap();
+        std::fs::write(
+            c.root.join(".awman/Dockerfile.a.dockerignore"),
+            "payload/private.txt\n",
+        )
+        .unwrap();
+        c.runtime.recipe_ignores.lock().unwrap().clear();
+        c.prepare().await.unwrap();
+        let (_, a, _) = c.tags();
+        let builds = c.runtime.built();
+        let ignores = c.runtime.recipe_ignores.lock().unwrap().clone();
+        let index = builds.iter().position(|tag| tag == &a).unwrap();
+        assert_eq!(ignores[index].as_deref(), Some("payload/private.txt\n"));
+        // The copy is removed with the pinned recipe.
+        let recipes = c.inputs.data_home.join("image-recipes");
+        let left: Vec<_> = std::fs::read_dir(&recipes)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_installed_image_fails_preparation_instead_of_being_reused() {
+        let c = case("engine::agent::image_freshness::prepare_tests::unreadable");
+        c.prepare().await.unwrap();
+        *c.runtime.inspection_error.lock().unwrap() = Some("metadata endpoint down".into());
+        let error = c.prepare().await.unwrap_err().to_string();
+        assert!(error.contains("could not verify image"), "{error}");
+        assert!(c.runtime.built().is_empty());
+        // Once the runtime answers again, the same inputs are reused.
+        *c.runtime.inspection_error.lock().unwrap() = None;
+        assert!(c.prepare().await.unwrap().rebuilt.is_empty());
     }
 }

@@ -25,7 +25,7 @@ use axum::Json;
 use tracing::instrument::WithSubscriber;
 
 use crate::command::daemon_api::browser::{may_view_terminal, BrowserPrincipal};
-use crate::command::daemon_api::terminals::{terminals_get, terminals_list, terminals_open};
+use crate::command::daemon_api::terminals::{terminals_get, terminals_list, terminals_open_with};
 use crate::command::daemon_api::{DaemonApi, Operation};
 use crate::command::terminals::{TerminalRefusal, TerminalSession};
 use crate::data::daemon_state::CommandListener;
@@ -164,11 +164,13 @@ fn listener_of(listener: Option<axum::Extension<CommandListener>>) -> CommandLis
     listener.map(|l| l.0).unwrap_or(CommandListener::Local)
 }
 
-fn flag(value: &str) -> Result<bool, ApiError> {
+fn flag(name: &str, value: &str) -> Result<bool, ApiError> {
     match value {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
-        _ => Err(ApiError::invalid_request("read_only must be true or false")),
+        _ => Err(ApiError::invalid_request(format!(
+            "{name} must be true or false"
+        ))),
     }
 }
 
@@ -247,10 +249,12 @@ async fn handle_get(
         return ApiError::terminal_not_found("terminal not found").into_response();
     };
     let mut read_only = false;
+    let mut history = false;
     for (key, value) in pairs {
-        if key == "read_only" {
-            match flag(&value) {
-                Ok(v) => read_only = v,
+        if key == "read_only" || key == "history" {
+            match flag(&key, &value) {
+                Ok(v) if key == "read_only" => read_only = v,
+                Ok(v) => history = v,
                 Err(error) => return error.into_response(),
             }
         }
@@ -289,7 +293,8 @@ async fn handle_get(
         ))
         .into_response();
     }
-    let session = match terminals_open(&api.terminals, &id, viewer) {
+    let options = crate::engine::terminal_hub::SubscribeOptions { history };
+    let session = match terminals_open_with(&api.terminals, &id, viewer, options) {
         Ok(session) => session,
         Err(refusal) => return refusal_error(&refusal).into_response(),
     };

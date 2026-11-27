@@ -704,7 +704,7 @@ pub(crate) async fn refresh_stale_workflow_images(
     sink: &mut dyn UserMessageSink,
     build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<crate::engine::agent::image_freshness::StaleImageRefresh, CommandError> {
-    use crate::engine::agent::image_freshness::{refresh_stale_images, SessionImageInputs};
+    use crate::engine::agent::image_freshness::SessionImageInputs;
     if session.lease_images().is_some()
         || engines.runtime.capabilities().image_acquisition
             != crate::engine::agent_runtime::ImageAcquisition::Build
@@ -732,8 +732,46 @@ pub(crate) async fn refresh_stale_workflow_images(
         }
     }
     let inputs = SessionImageInputs::for_repo(git_root, &session.effective_config())?;
+    prepare_workflow_images_at(
+        engines,
+        &inputs,
+        &agents,
+        crate::engine::agent::image_freshness::MissingImages::Skip,
+        sink,
+        build_output,
+    )
+    .await
+}
+
+/// The root-explicit form of [`refresh_stale_workflow_images`] (WI 0105):
+/// decide and build the project image and `agents`' images from `inputs`
+/// (an explicit image root and project Dockerfile, not the session's), with
+/// the same sink and build-output routing. Agent recipes must already be
+/// provisioned under `inputs.git_root`. With [`MissingImages::Build`] a
+/// missing image is built too and a failed build of one is an error; a
+/// failed refresh of an installed image keeps it and reports
+/// `image_stale` either way.
+///
+/// [`MissingImages::Build`]: crate::engine::agent::image_freshness::MissingImages::Build
+pub(crate) async fn prepare_workflow_images_at(
+    engines: &Engines,
+    inputs: &crate::engine::agent::image_freshness::SessionImageInputs,
+    agents: &[String],
+    missing: crate::engine::agent::image_freshness::MissingImages,
+    sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
+) -> Result<crate::engine::agent::image_freshness::StaleImageRefresh, CommandError> {
     let mut sink = StepImageSink { sink, build_output };
-    Ok(refresh_stale_images(engines.runtime.clone(), &inputs, &agents, &mut sink).await?)
+    Ok(
+        crate::engine::agent::image_freshness::prepare_session_images(
+            engines.runtime.clone(),
+            inputs,
+            agents,
+            missing,
+            &mut sink,
+        )
+        .await?,
+    )
 }
 
 /// Ensure a Dockerfile-backed agent image is available for a container runtime,
@@ -763,19 +801,98 @@ async fn import_agent_image_for_step(
     sink: &mut dyn UserMessageSink,
     build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
-    use crate::engine::image_prep::{AgentImagePreparer, ImageBuildContext};
+    // The context's default agent is the session's configured one, not the
+    // agent being prepared: a non-default agent must not reuse a
+    // single-image default source, exactly as `ready` refuses it.
+    let context = crate::engine::image_prep::ImageBuildContext::for_repo(
+        git_root,
+        &session.effective_config(),
+        session.configured_agent().as_str(),
+    );
+    import_agent_image_in(
+        runtime,
+        context,
+        agent,
+        session,
+        definition,
+        sink,
+        build_output,
+    )
+    .await
+}
+
+/// Prepare one agent image on an importing runtime for a squad directory task:
+/// the task's own recipe (`project_dockerfile`) is used, never
+/// `runtime.dockerfile` from session configuration, and every stale-image
+/// warning the preparer reports is returned so the run records it.
+pub(crate) async fn import_task_agent_image(
+    engines: &Engines,
+    root: &std::path::Path,
+    project_dockerfile: &std::path::Path,
+    agent: &str,
+    session: &crate::data::session::Session,
+    sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
+) -> Result<Vec<crate::data::execution_event::ImageStaleWarning>, CommandError> {
+    let name = crate::data::session::AgentName::new(agent).map_err(EngineError::Data)?;
+    let definition = engines.agent_engine.resolve_definition(session, &name)?;
+    let context = crate::engine::image_prep::ImageBuildContext {
+        git_root: root.to_path_buf(),
+        project_dockerfile: project_dockerfile.to_path_buf(),
+        default_agent: session.configured_agent().as_str().to_string(),
+    };
+    let mut collecting = CollectStale {
+        sink,
+        warnings: Vec::new(),
+    };
+    import_agent_image_in(
+        engines.runtime.clone(),
+        context,
+        agent,
+        session,
+        definition,
+        &mut collecting,
+        build_output,
+    )
+    .await?;
+    Ok(collecting.warnings)
+}
+
+/// Forwards everything and keeps each stale-image warning.
+struct CollectStale<'a> {
+    sink: &'a mut dyn UserMessageSink,
+    warnings: Vec<crate::data::execution_event::ImageStaleWarning>,
+}
+impl UserMessageSink for CollectStale<'_> {
+    fn write_message(&mut self, message: UserMessage) {
+        self.sink.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.sink.replay_queued();
+    }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.warnings.push(warning.clone());
+        self.sink.report_image_stale(warning);
+    }
+}
+
+async fn import_agent_image_in(
+    runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
+    context: crate::engine::image_prep::ImageBuildContext,
+    agent: &str,
+    session: &crate::data::session::Session,
+    definition: crate::engine::agent::ResolvedAgent,
+    sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
+) -> Result<(), CommandError> {
+    use crate::engine::image_prep::AgentImagePreparer;
+    let git_root = context.git_root.clone();
+    let git_root = git_root.as_path();
     let preparer = AgentImagePreparer::new(
         session.effective_config().builtin_settings()?,
         runtime,
         crate::data::fs::data_paths::data_home(session.effective_config().env())?,
-        // The context's default agent is the session's configured one, not the
-        // agent being prepared: a non-default agent must not reuse a
-        // single-image default source, exactly as `ready` refuses it.
-        ImageBuildContext::for_repo(
-            git_root,
-            &session.effective_config(),
-            session.configured_agent().as_str(),
-        ),
+        context,
     )
     .with_definition_env(session.env().clone())
     .with_definition(definition);

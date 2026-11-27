@@ -112,6 +112,23 @@ pub async fn tasks_workflow(api: &DaemonApi, id: &TaskId) -> Result<WorkflowStat
         .await?
         .ok_or(SquadError::NoWorkflow)
 }
+pub async fn runs_workflow(
+    api: &DaemonApi,
+    task_id: &TaskId,
+    run_id: &RunId,
+) -> Result<crate::data::fs::RunWorkflow, SquadError> {
+    let task = tasks_get(api, task_id).await?;
+    gateway(api)
+        .run_workflow(&task.name, run_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("run not found for task") {
+                SquadError::RunNotFound
+            } else {
+                SquadError::Command(error)
+            }
+        })
+}
 pub async fn runs_list(
     api: &DaemonApi,
     id: &TaskId,

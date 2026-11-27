@@ -173,7 +173,6 @@ impl SquadAgentLauncher {
         agents: &[String],
     ) -> Result<Vec<String>, EngineError> {
         std::fs::create_dir_all(root).map_err(|e| EngineError::io(root, e))?;
-        let paths = RepoDockerfilePaths::new(root);
         let mut definitions = Vec::new();
         for agent in agents {
             let name = AgentName::new(agent)?;
@@ -183,13 +182,54 @@ impl SquadAgentLauncher {
                 Some(root),
             )?);
         }
+        // Create-if-missing without following a link (WI 0105): `exists()`
+        // would follow a dangling symlink and write through it.
+        let tree = crate::data::fs::repo_tree::RepoTree::open(root)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let rel = crate::data::fs::repo_tree::RepoRelPath::new(std::path::Path::new(
+            crate::data::fs::squad_paths::PROJECT_RECIPE,
+        ))
+        .expect("a plain relative path");
+        tree.create_new(
+            &rel,
+            crate::data::templates::project_dockerfile_dev().as_bytes(),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+        Self::provision_agent_recipes(root, definitions).await
+    }
 
-        let project = paths.project_dockerfile();
-        if !project.exists() {
-            std::fs::write(&project, crate::data::templates::project_dockerfile_dev())
-                .map_err(|e| EngineError::io(&project, e))?;
+    /// Scaffold a squad directory task's task-owned image context (WI 0105):
+    /// `Dockerfile.dev` and `.awman/Dockerfile.<agent>` for `agents`,
+    /// create-if-missing, never overwriting an edited file.
+    ///
+    /// Agent definitions resolve from `definition_root` — the task's session
+    /// root, which for a custom non-Git task is its chosen directory — so the
+    /// same custom definitions (and approvals) apply wherever the recipes
+    /// live. Only the context is written.
+    pub async fn ensure_task_image_context(
+        env: &crate::data::config::env::EnvSnapshot,
+        context: &crate::data::fs::squad_paths::TaskImageContext,
+        definition_root: &Path,
+        agents: &[String],
+    ) -> Result<Vec<String>, EngineError> {
+        let mut definitions = Vec::new();
+        for agent in agents {
+            let name = AgentName::new(agent)?;
+            definitions.push(crate::engine::agent::AgentRegistry::resolve(
+                env,
+                &name,
+                Some(definition_root),
+            )?);
         }
+        context.ensure_project_recipe(crate::data::templates::project_dockerfile_dev())?;
+        Self::provision_agent_recipes(context.root(), definitions).await
+    }
 
+    async fn provision_agent_recipes(
+        root: &Path,
+        definitions: Vec<crate::engine::agent::ResolvedAgent>,
+    ) -> Result<Vec<String>, EngineError> {
+        let paths = RepoDockerfilePaths::new(root);
         let base_tag = crate::data::image_tags::project_image_tag(root);
         let mut warnings = Vec::new();
         for def in definitions {

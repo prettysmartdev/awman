@@ -40,6 +40,30 @@ pub trait RunProgress: Send + Sync {
     ///
     /// Default no-op: a caller with no run row to update ignores it.
     fn leader_resolved(&self, _task: &str, _agent: &str, _model: Option<&str>) {}
+
+    /// Image preparation for a directory task's run (WI 0105). See
+    /// [`ImagePreparationEvent`] for exactly when each event is sent.
+    ///
+    /// Default no-op: a caller with no run row to update ignores it.
+    fn image_preparation(&self, _run_id: &RunId, _event: ImagePreparationEvent) {}
+}
+
+/// What a run's image preparation reports through
+/// [`RunProgress::image_preparation`].
+///
+/// * `BuildStarted` — an actual build of `image` is starting: the build lease
+///   is held and the image was re-inspected under it and still needs
+///   building. Never sent for a reused image, nor while only waiting for
+///   another process's lease (that process's build is reused afterwards).
+/// * `Stale` — a refresh of `image` failed and the previously installed
+///   image is kept for this run (the WI 0163 fallback). It is never fresh.
+/// * `PreparationFinished` — sent exactly once per preparation that began,
+///   after the last build, on success, failure and cancellation alike.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImagePreparationEvent {
+    BuildStarted { image: String },
+    Stale { image: String, reason: String },
+    PreparationFinished,
 }
 
 /// A `RunProgress` that records nothing. Used by tests and by any caller with no

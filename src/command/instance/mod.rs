@@ -910,7 +910,7 @@ impl EngineInstance {
                 dialog_response_tx: dialog_resp_tx,
             },
             slot_io: ContainerSlotIo {
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stdin_tx,
                 resize_tx,
             },

@@ -78,6 +78,7 @@ impl WorkflowStateSource for RemoteApiWorkflowSource {
 pub struct SquadTaskWorkflowSource {
     gateway: Arc<dyn TaskGateway>,
     task: String,
+    run_id: Option<crate::data::ids::RunId>,
 }
 
 impl SquadTaskWorkflowSource {
@@ -85,14 +86,46 @@ impl SquadTaskWorkflowSource {
         Self {
             gateway,
             task: task.into(),
+            run_id: None,
         }
+    }
+
+    pub fn pinned(
+        gateway: Arc<dyn TaskGateway>,
+        task: impl Into<String>,
+        run_id: crate::data::ids::RunId,
+    ) -> Self {
+        Self {
+            gateway,
+            task: task.into(),
+            run_id: Some(run_id),
+        }
+    }
+
+    async fn matches_pin(&self) -> Result<bool, CommandError> {
+        let Some(id) = &self.run_id else {
+            return Ok(true);
+        };
+        Ok(self
+            .gateway
+            .runs(&self.task, 1)
+            .await?
+            .first()
+            .is_some_and(|run| &run.id == id && run.status == crate::data::fs::RunStatus::Running))
     }
 }
 
 #[async_trait]
 impl WorkflowStateSource for SquadTaskWorkflowSource {
     async fn fetch_workflow_state(&self) -> Result<Option<WorkflowState>, CommandError> {
-        self.gateway.workflow_state(&self.task).await
+        if !self.matches_pin().await? {
+            return Ok(None);
+        }
+        let state = self.gateway.workflow_state(&self.task).await?;
+        if !self.matches_pin().await? {
+            return Ok(None);
+        }
+        Ok(state)
     }
 }
 
@@ -103,6 +136,7 @@ pub struct RemoteWorkflowPoller {
     reachable: Arc<AtomicBool>,
     on_state: Box<dyn FnMut(&WorkflowState) + Send>,
     initial_state_seen: bool,
+    stop_on_disappearance: bool,
 }
 
 impl RemoteWorkflowPoller {
@@ -115,6 +149,7 @@ impl RemoteWorkflowPoller {
             reachable: Arc::new(AtomicBool::new(true)),
             on_state,
             initial_state_seen: false,
+            stop_on_disappearance: true,
         }
     }
 
@@ -128,6 +163,13 @@ impl RemoteWorkflowPoller {
     /// initial snapshot before starting this poller.
     pub fn with_initial_state_seen(mut self, seen: bool) -> Self {
         self.initial_state_seen = seen;
+        self
+    }
+
+    /// Run followers own their lifetime; a missing snapshot during a phase
+    /// transition must not stop overview polling.
+    pub fn with_stop_on_disappearance(mut self, stop: bool) -> Self {
+        self.stop_on_disappearance = stop;
         self
     }
 
@@ -170,7 +212,9 @@ impl RemoteWorkflowPoller {
             // A failed state fetch always keeps polling, even if a separate
             // status route happened to report terminal in the same cycle.
             None => false,
-            Some(disappeared_after_state) => terminal || disappeared_after_state,
+            Some(disappeared_after_state) => {
+                terminal || (self.stop_on_disappearance && disappeared_after_state)
+            }
         }
     }
 

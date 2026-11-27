@@ -376,10 +376,19 @@ impl CommandLayerFactory {
         // Use the original repo root for image tag derivation so worktree-
         // based runs resolve the correct image for both the Image option AND
         // for image_home_dir inspection (which determines overlay mount paths).
-        let correct_tag = crate::data::image_tags::agent_image_tag(
-            &self.image_git_root,
-            runtime.step_agent.as_str(),
-        );
+        // Images pinned on the session (a worker lease, or a squad directory
+        // task's prepared run, WI 0105) are what the engine launches, so
+        // inspect that tag rather than one derived from the root.
+        let correct_tag = session
+            .lease_images()
+            .and_then(|images| images.agents.get(runtime.step_agent.as_str()))
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::data::image_tags::agent_image_tag(
+                    &self.image_git_root,
+                    runtime.step_agent.as_str(),
+                )
+            });
         // Every step shares the command's one outputs directory (WI 0137 §3).
         let directory_overlays = collected.directories;
         let mut command_mounts = Vec::new();

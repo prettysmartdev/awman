@@ -246,7 +246,12 @@ impl AgentImagePreparer {
             std::fs::read(RepoDockerfilePaths::new(git_root).agent_dockerfile(agent)).ok();
         let inputs_current = if let (Some(parent_id), Some(agent_bytes)) = (parent_id, agent_bytes)
         {
-            let expected = crate::data::image_inputs::agent_inputs_hash(&agent_bytes, &parent_id);
+            let expected = crate::data::image_inputs::agent_inputs_hash_in(
+                git_root,
+                agent,
+                &agent_bytes,
+                &parent_id,
+            );
             parent_current
                 && matches!(
                     self.source_freshness(target.clone(), resolved.reference.clone(), &expected)
@@ -398,6 +403,7 @@ impl AgentImagePreparer {
                     platform: resolved.platform.clone(),
                     build_args: Vec::new(),
                     no_cache: policy.no_cache(),
+                    cancel: Default::default(),
                 };
                 self.last_installed_inputs = match &parent {
                     ImageFreshness::Fresh(image)
@@ -481,9 +487,9 @@ impl AgentImagePreparer {
             ImageFreshness::Missing => None,
         };
         self.last_build_inputs = parent_id.and_then(|id| {
-            std::fs::read(&dockerfile)
-                .ok()
-                .map(|bytes| crate::data::image_inputs::agent_inputs_hash(&bytes, &id))
+            std::fs::read(&dockerfile).ok().map(|bytes| {
+                crate::data::image_inputs::agent_inputs_hash_in(git_root, agent, &bytes, &id)
+            })
         });
         self.last_installed_inputs = if let Some(expected) = self.last_build_inputs.clone() {
             match self
@@ -511,6 +517,7 @@ impl AgentImagePreparer {
             platform: resolved.platform.clone(),
             build_args: Vec::new(),
             no_cache: policy.no_cache(),
+            cancel: Default::default(),
         };
         let receipt = self
             .build_source(request, resolved.docker_endpoint.as_ref(), frontend)

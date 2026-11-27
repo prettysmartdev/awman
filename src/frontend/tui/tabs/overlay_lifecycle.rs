@@ -89,9 +89,11 @@ impl Tab {
     /// Closes the container overlay on completion so the user regains full
     /// keyboard control without having to manually cycle Ctrl+M.
     pub fn poll_command_completion(&mut self) {
+        let mut completed = false;
         if let Some(ref rx) = self.command_result_rx {
             match rx.try_recv() {
                 Ok(Ok(outcome)) => {
+                    completed = true;
                     let cmd_name = self.execution_phase.command_name().to_string();
                     // One exit-code policy, and it is Layer 2's
                     // (`CommandOutcome::exit_code`, F-42). The TUI used to
@@ -125,6 +127,7 @@ impl Tab {
                     self.clear_container_slots();
                 }
                 Ok(Err(err)) => {
+                    completed = true;
                     let cmd_name = self.execution_phase.command_name().to_string();
                     let err_msg = format!("{err}");
                     if let Ok(mut log) = self.shared.status_log.lock() {
@@ -144,6 +147,7 @@ impl Tab {
                     // Still running — nothing to do.
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    completed = true;
                     // Command task dropped without sending a result — in
                     // practice this means the task panicked. The panic hook
                     // records the backtrace; point the user at it.
@@ -173,6 +177,47 @@ impl Tab {
                     });
                     self.close_container_overlay(-1);
                     self.clear_container_slots();
+                }
+            }
+        }
+        if completed {
+            self.command_result_rx = None;
+            // The receiver and the view are replaced together on submit.
+            // An old command owns neither this receiver nor a newer generation.
+            let view = self
+                .squad
+                .as_mut()
+                .and_then(|state| state.attach_view.take());
+            if let Some(view) = view {
+                self.squad
+                    .as_ref()
+                    .unwrap()
+                    .attach_session
+                    .end_if_current(view.generation);
+                let phase = self.execution_phase.clone();
+                let status = self
+                    .shared
+                    .attach_status
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.clone())
+                    .or_else(|| {
+                        self.shared
+                            .status_log
+                            .lock()
+                            .ok()?
+                            .iter()
+                            .rev()
+                            .find(|line| line.level == crate::data::message::MessageLevel::Info)
+                            .map(|line| crate::data::message::UserMessage {
+                                level: line.level,
+                                text: line.text.clone(),
+                            })
+                    });
+                self.end_attach_session();
+                self.execution_phase = phase;
+                if let Ok(mut message) = self.shared.attach_status.lock() {
+                    *message = status;
                 }
             }
         }

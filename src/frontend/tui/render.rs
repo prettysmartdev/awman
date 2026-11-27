@@ -151,7 +151,7 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     // execution/container rendering applies unchanged, which is what makes
     // attach reproduce the `exec workflow --dynamic` UX with no renderer
     // changes (see WI 0102 §0.3).
-    if app.active_tab().is_squad && app.active_tab().container_slots.is_empty() {
+    if app.squad_grid_active() {
         squad::render_squad_body(app, chunks[1], frame);
     } else {
         execution_window::render_execution_window(app, chunks[1], frame);

@@ -199,6 +199,18 @@ pub enum TerminalFrame {
         #[serde(with = "base64_bytes")]
         bytes: Vec<u8>,
     },
+    /// Retained raw output emitted before this viewer connected (WI 0105).
+    /// Sent only to a viewer that asked for it (`?history=true`), before the
+    /// first `Snapshot`, in order, each at most 16 KiB. It is real output a
+    /// viewer may scroll; the following `Snapshot` repaints the current
+    /// screen. `truncated` (first frame only) says older output was evicted
+    /// or withheld; a withheld history is one empty truncated frame.
+    History {
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+        #[serde(default)]
+        truncated: bool,
+    },
     Resize {
         cols: u16,
         rows: u16,
@@ -407,6 +419,62 @@ pub enum ProgramStatusMode {
 pub struct HostOutputPolicy {
     pub allow_notifications: bool,
     pub program_status: ProgramStatusMode,
+}
+
+#[cfg(test)]
+mod history_frame_tests {
+    use super::*;
+
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../web/test/lib/fixtures/terminal-frames.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn history_frames_round_trip_and_default_truncated() {
+        let fixture = fixture();
+        let examples = &fixture["history_examples"];
+        let mut bytes = Vec::new();
+        for (index, frame) in examples["server"].as_array().unwrap().iter().enumerate() {
+            let typed: TerminalFrame = serde_json::from_value(frame.clone()).unwrap();
+            let TerminalFrame::History {
+                bytes: chunk,
+                truncated,
+            } = &typed
+            else {
+                panic!("not a history frame: {frame}");
+            };
+            assert_eq!(*truncated, index == 0);
+            bytes.extend_from_slice(chunk);
+            assert_eq!(serde_json::to_value(&typed).unwrap(), *frame);
+        }
+        assert_eq!(bytes, b"line 1\r\nline 2\r\nline 3\r\n");
+        assert_eq!(
+            serde_json::from_value::<TerminalFrame>(examples["without_truncated"].clone()).unwrap(),
+            TerminalFrame::History {
+                bytes: Vec::new(),
+                truncated: false
+            }
+        );
+        for frame in examples["invalid"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<TerminalFrame>(frame.clone()).is_err(),
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stream_without_history_still_parses() {
+        // Older servers never send `history`; every v1 server frame still
+        // decodes and none of them is a history frame.
+        for frame in fixture()["server"].as_array().unwrap() {
+            let typed: TerminalFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert!(!matches!(typed, TerminalFrame::History { .. }));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -81,9 +81,9 @@ On the runtimes that build images locally (`docker` and `apple`), awman labels e
 The hash covers:
 
 - **Project image:** the project Dockerfile (`Dockerfile.dev`, or the file named by `runtime.dockerfile`) and the content of every file or directory the Dockerfile `COPY`s or `ADD`s from the build context. File contents, paths and executable permissions count; modification times do not. The root `.dockerignore` and the selected Dockerfile’s `.dockerignore` file also count, so changes to exclusions trigger a rebuild.
-- **Agent image:** the `.awman/Dockerfile.<agent>` file and the ID of the project image it was built on, so rebuilding the project image rebuilds the agent images on top of it.
+- **Agent image:** the `.awman/Dockerfile.<agent>` file and the ID of the project image it was built on, so rebuilding the project image rebuilds the agent images on top of it. When the agent recipe has local `COPY` or `ADD` sources, their files and the context-root and recipe-specific ignore policies are hashed too; editing one of those inputs rebuilds that agent image.
 
-Some sources cannot be resolved to files, so only the Dockerfile text itself covers them: wildcards (`*`, `?`, `[`), variables (`$`), URLs, paths that escape the context, a whole-context copy (`COPY . .`, which would otherwise rebuild on every change), more than 10,000 files in one directory, more than 512 MiB in total, and unreadable paths. `COPY --from=` is ignored, symlinks are hashed by their link target text and never followed, and ignore patterns are not applied to the files being hashed (so excluded files can cause an extra rebuild). `ONBUILD` instructions and `RUN --mount` inputs are not resolved. Agent hashes do not include files copied from the context by an agent Dockerfile; use `ready --build` after changing those files.
+Some sources cannot be resolved to files, so only the Dockerfile text itself covers them: wildcards (`*`, `?`, `[`), variables (`$`), URLs, paths that escape the context, a whole-context copy (`COPY . .`, which would otherwise rebuild on every change), more than 10,000 files in one directory, more than 512 MiB in total, and unreadable paths. `COPY --from=` is ignored, symlinks are hashed by their link target text and never followed, and ignore patterns are not applied to the files being hashed (so excluded files can cause an extra rebuild). `ONBUILD` instructions and `RUN --mount` inputs are not resolved. For unresolved agent recipe inputs, use `ready --build` after changing those files.
 
 ### When images are rebuilt
 
@@ -104,7 +104,7 @@ retains that warning instead of declaring the image satisfied.
 
 Image tags are named after the repository folder, so alternating between branches whose Dockerfiles or copied files differ rebuilds the image each time you switch.
 
-If a rebuild fails, awman **warns and continues** with the image it already has. API clients receive an `image_stale` event. `awman ready --build` still fails when its build fails. Plain `awman ready` does not rebuild stale images. With an enabled Docker-local or Apple-local builder, builtin session setup can also rebuild stale source images before import; a failed rebuild keeps the installed image. Registry/archive sources and disabled builders retain their import behavior.
+If a rebuild of an installed image fails, awman **warns and continues** with the image it already has. API clients receive an `image_stale` event. If awman cannot inspect an installed image to establish its freshness, a launch that requires freshness fails instead of silently reusing an unverified image. `awman ready --build` still fails when its build fails. Plain `awman ready` does not rebuild stale images. With an enabled Docker-local or Apple-local builder, builtin session setup can also rebuild stale source images before import; a failed rebuild keeps the installed image. Registry/archive sources and disabled builders retain their import behavior.
 
 ### Content awman cannot see
 

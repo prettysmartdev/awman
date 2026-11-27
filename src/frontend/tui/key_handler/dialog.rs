@@ -62,6 +62,11 @@ pub(super) fn handle(app: &mut App, action: Action) {
             // table with the same row still selected.
             if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
                 if state.run_detail.take().is_some() {
+                    if let Some(squad) = app.active_tab().squad.as_ref() {
+                        if let Ok(mut request) = squad.run_workflow_request.lock() {
+                            *request = None;
+                        }
+                    }
                     return;
                 }
             }

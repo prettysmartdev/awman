@@ -189,7 +189,12 @@ pub(super) async fn agents_for_lease(
                 &format!(".awman/Dockerfile.{name}"),
             )
             .map_err(|e| invalid(e.to_string()))?;
-            let mut hash = crate::data::image_inputs::agent_inputs_hash(&bytes, &project_id);
+            let mut hash = crate::data::image_inputs::agent_inputs_hash_in(
+                session.git_root(),
+                name,
+                &bytes,
+                &project_id,
+            );
             if !crate::data::image_inputs::resolve_copy_sources(&String::from_utf8_lossy(&bytes))
                 .is_empty()
             {

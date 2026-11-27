@@ -252,6 +252,48 @@ pub fn agent_inputs_hash(agent_dockerfile: &[u8], project_image_id: &str) -> Inp
     InputsHash(sha256_hex(manifest))
 }
 
+/// [`agent_inputs_hash`] plus the agent recipe's own build-context inputs:
+/// the files its `COPY`/`ADD` sources name and the ignore policies that
+/// select them (the context-root `.dockerignore` and the recipe-specific
+/// `<recipe>.dockerignore`), resolved against `context` as for the project
+/// image. A recipe without local sources hashes exactly as
+/// [`agent_inputs_hash`], so existing images are not rebuilt needlessly.
+pub fn agent_inputs_hash_at(
+    agent_dockerfile: &[u8],
+    project_image_id: &str,
+    context: &dyn BuildContext,
+    dockerfile_path: &str,
+) -> InputsHash {
+    let base = agent_inputs_hash(agent_dockerfile, project_image_id);
+    let text = String::from_utf8_lossy(agent_dockerfile);
+    if !resolve_copy_sources(&text)
+        .iter()
+        .any(|source| matches!(source, CopySource::Path(_)))
+    {
+        return base;
+    }
+    let local = project_inputs_at(Some(agent_dockerfile), context, dockerfile_path).hash;
+    InputsHash(sha256_hex(format!(
+        "{SCHEME}\nagent-local\nbase {base}\nlocal {local}\n"
+    )))
+}
+
+/// [`agent_inputs_hash_at`] for the agent recipe `.awman/Dockerfile.<agent>`
+/// of the build context rooted at `root`.
+pub fn agent_inputs_hash_in(
+    root: &std::path::Path,
+    agent: &str,
+    agent_dockerfile: &[u8],
+    project_image_id: &str,
+) -> InputsHash {
+    agent_inputs_hash_at(
+        agent_dockerfile,
+        project_image_id,
+        &DirBuildContext::new(root),
+        &format!(".awman/Dockerfile.{agent}"),
+    )
+}
+
 /// An imported image's inputs hash: the source digest.
 pub fn imported_inputs_hash(source_digest: &str) -> InputsHash {
     InputsHash::from_source_digest(source_digest)

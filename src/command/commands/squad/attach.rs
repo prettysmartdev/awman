@@ -12,6 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+mod follow;
+pub use follow::{pin_current_run, FollowEvent, PinnedRun, RunFollower};
+
 pub const WAITING_FOR_TERMINAL: &str = "Waiting for agent terminal to start…";
 
 /// Inject a short policy in component tests; production uses the bounded

@@ -49,7 +49,7 @@ fn unit(id: &'static str) -> Unit {
     Unit {
         _sandbox: sandbox,
         root,
-        backend: RemoteInstanceBackend { shared },
+        backend: Arc::new(RemoteInstanceBackend { shared }),
         outbound: outbound_rx,
     }
 }
@@ -101,7 +101,7 @@ fn session_spec(root: &Path) -> InitialTabSpec {
 struct Unit {
     _sandbox: TestSandbox,
     root: PathBuf,
-    backend: RemoteInstanceBackend,
+    backend: Arc<RemoteInstanceBackend>,
     outbound: UnboundedReceiver<Outbound>,
 }
 impl Unit {
@@ -622,4 +622,103 @@ async fn activity_during_a_board_bypasses_throttle_and_deferred_activity_is_reta
             .any(|f| matches!(f, FrontendFrame::Activity { .. })),
         "touching a board must immediately prevent automatic dismissal"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn squad_detach_barrier_keeps_late_deltas_and_completion_on_retired_feeds() {
+    let mut unit = unit("command::instance::remote::contracts::squad_detach_barrier_keeps_late_deltas_and_completion_on_retired_feeds");
+    let tab_id = TabId::new();
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![slot("leader", None)],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected daemon tab");
+    };
+    let mut presenter = tab.feeds;
+    let retired = presenter.clone();
+    presenter.detach();
+    let session_id = tab.session.id();
+    // A cancelled run that was not a Squad viewer is never a barrier: the
+    // next submit is not held up and registers no completion waiter.
+    unit.backend.shared.lock().tabs[0]
+        .run
+        .as_mut()
+        .unwrap()
+        .squad_viewer = false;
+    unit.backend
+        .finish_cancelled_squad_attach(&session_id)
+        .unwrap();
+    assert!(unit.backend.shared.lock().tabs[0]
+        .run
+        .as_ref()
+        .unwrap()
+        .finish_waiters
+        .is_empty());
+    unit.backend.shared.lock().tabs[0]
+        .run
+        .as_mut()
+        .unwrap()
+        .squad_viewer = true;
+    let backend = unit.backend.clone();
+    // The synchronous submit boundary can run while the real reducer
+    // receives the old command's final frames on the transport driver.
+    let barrier = std::thread::spawn(move || backend.finish_cancelled_squad_attach(&session_id));
+    awman_test_support::wait_for(
+        "the detached viewer's completion barrier",
+        Duration::from_secs(5),
+        || {
+            let state = unit.backend.shared.lock();
+            (!state.tabs[0]
+                .run
+                .as_ref()
+                .unwrap()
+                .finish_waiters
+                .is_empty())
+            .then_some(())
+        },
+    );
+    unit.delta(InstanceDelta::Workflow {
+        tab_id: tab_id.clone(),
+        view: Some(Default::default()),
+        invocation_id: Some(uuid::Uuid::new_v4()),
+        context_path: None,
+        worktree_path: None,
+    });
+    unit.delta(InstanceDelta::SlotLaunched {
+        tab_id: tab_id.clone(),
+        slot: slot("late-old-step", None),
+    });
+    assert!(presenter.workflow.snapshot().view.is_none());
+    assert!(presenter.container.events.lock().unwrap().is_empty());
+    assert!(retired.workflow.snapshot().view.is_some());
+    assert!(
+        !barrier.is_finished(),
+        "late deltas are not the completion barrier"
+    );
+    unit.frame(EngineFrame::CommandFinished {
+        tab_id: tab_id.clone(),
+        result: crate::data::frontend_protocol::CommandResultWire {
+            automation: None,
+            exit_code: 0,
+            outcome: None,
+            error: None,
+        },
+    });
+    barrier.join().unwrap().unwrap();
+    assert!(unit.sent().iter().any(|frame| matches!(frame, FrontendFrame::Cancel { tab_id: id, repeat: false } if id == &tab_id)));
+    // Installing a new generation's feeds after the barrier cannot inherit
+    // any of those old slots, workflow state or the old command's result.
+    let (run, feeds, _) = new_run(presenter.clone());
+    {
+        let mut state = unit.backend.shared.lock();
+        state.tabs[0].feeds = presenter.clone();
+        state.tabs[0].run = Some(run);
+    }
+    assert!(presenter.workflow.snapshot().view.is_none());
+    assert!(presenter.container.events.lock().unwrap().is_empty());
+    assert!(feeds.command_result_rx.try_recv().is_err());
+    assert!(!presenter.command_cancel.is_cancelled());
 }
