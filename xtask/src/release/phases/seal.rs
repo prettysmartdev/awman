@@ -224,7 +224,9 @@ pub fn seal(ctx: &mut Ctx) -> Step {
         );
     }
     expiry(ctx)?;
+    ctx.event("rechecking retained CI and build evidence");
     super::hosted::verify_hosted_records(ctx)?;
+    ctx.event("rechecking native results");
     super::hosted::verify_native_records(ctx)?;
     let sums: BTreeMap<String, String> = ctx
         .j
@@ -244,6 +246,7 @@ pub fn seal(ctx: &mut Ctx) -> Step {
         &ev,
     )?;
     let draft = find_draft(ctx)?;
+    ctx.event(&format!("reconciling draft {}", draft.id));
     if ctx.j.release.draft_id != Some(draft.id) {
         ctx.j.release.draft_id = Some(draft.id);
         ctx.save()?;
@@ -262,7 +265,13 @@ pub fn seal(ctx: &mut Ctx) -> Step {
         );
     }
     for (name, path, sha) in &expected {
-        reconcile(ctx, &draft, name, path, sha)?;
+        let bytes = std::fs::metadata(path).map_err(anyhow::Error::from)?.len();
+        ctx.event(&format!("{name}: reconciling {bytes} bytes"));
+        let asset = reconcile(ctx, &draft, name, path, sha)?;
+        ctx.event(&format!(
+            "{name}: upload reconciled as asset {} ({bytes} bytes)",
+            asset.id
+        ));
     }
     // Re-read the draft from GitHub and freeze exactly what it holds.
     let draft = ctx
@@ -274,6 +283,7 @@ pub fn seal(ctx: &mut Ctx) -> Step {
         .ok_or_else(|| Stop::new("draft-foreign", format!("draft {} disappeared", draft.id)))?;
     let mut sealed = Vec::new();
     for (name, _, sha) in &expected {
+        ctx.event(&format!("{name}: verifying draft bytes"));
         let a = draft
             .assets
             .iter()
@@ -343,6 +353,7 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
     if ctx.j.release.confirmed_seal.as_deref() == Some(digest.as_str()) {
         return Ok(());
     }
+    ctx.event("PUBLICATION CONFIRMATION: review the sealed release before proceeding");
     let main = ctx
         .w
         .forge
@@ -356,7 +367,7 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
         _ => "already on main",
     };
     let mut s = format!(
-        "\nRelease {} — ready to publish\n  commit   {}\n  tree     {}\n  landing  {landing}\n  seal     sha256:{digest}\n",
+        "\n========== PUBLICATION CONFIRMATION ==========\nRelease {} — ready to publish\n  commit   {}\n  tree     {}\n  landing  {landing}\n  seal     sha256:{digest}\n",
         ctx.j.version, ctx.j.commit, ctx.j.tree
     );
     for a in &seal.assets {

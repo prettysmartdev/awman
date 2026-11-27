@@ -79,6 +79,8 @@ pub struct JobInfo {
     pub attempt: u32,
     /// Names of steps whose conclusion was `failure`.
     pub failed_steps: Vec<String>,
+    /// Currently running step, when Actions exposes one.
+    pub active_step: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +167,10 @@ pub trait Forge {
     fn latest_run(&self, workflow: &str, branch: &str) -> Step<Option<RunInfo>>;
     fn run(&self, id: u64) -> Step<RunInfo>;
     fn jobs(&self, run_id: u64) -> Step<Vec<JobInfo>>;
+    /// Best-effort operator status, outside evidence and fault accounting.
+    fn progress_snapshot(&self, _run_id: u64) -> Option<(RunInfo, Vec<JobInfo>)> {
+        None
+    }
     fn rerun_failed(&self, run_id: u64) -> Step;
     fn cancel(&self, run_id: u64) -> Step;
     fn artifacts(&self, run_id: u64) -> Step<Vec<ArtifactInfo>>;

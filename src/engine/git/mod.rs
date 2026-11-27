@@ -1004,6 +1004,9 @@ impl GitEngine {
         let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
             host_command::command(&self.env, cwd)
                 .args(args)
+                // Blob-filtered checkouts fetch selected blobs from the
+                // promisor remote; ordinary host Git operations disallow it.
+                .env("GIT_NO_LAZY_FETCH", "0")
                 .current_dir(cwd)
                 .output()
                 .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", args.join(" "))))
@@ -1023,7 +1026,13 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<SparseCloneOutcome, EngineError> {
         let outcome = self.clone_repo_sparse_inner(url, dest, subdir, &mut |args, cwd| {
-            run_git_logged(&self.env, args, cwd, &mut *sink)
+            run_git_logged_env(
+                &self.env,
+                args,
+                cwd,
+                &[("GIT_NO_LAZY_FETCH", "0")],
+                &mut *sink,
+            )
         })?;
         if outcome == SparseCloneOutcome::FellBackToShallow {
             sink.write_message(UserMessage {
@@ -1097,7 +1106,8 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
     ) -> Result<(), EngineError> {
         let fetch_args = ["fetch", "--depth", "1", "origin"];
-        let fetch = run_git_logged(&self.env, &fetch_args, repo_dir, sink)?;
+        let lazy_fetch = [("GIT_NO_LAZY_FETCH", "0")];
+        let fetch = run_git_logged_env(&self.env, &fetch_args, repo_dir, &lazy_fetch, sink)?;
         if !fetch.status.success() {
             let stderr = String::from_utf8_lossy(&fetch.stderr);
             return Err(EngineError::Git(format!(
@@ -1105,10 +1115,11 @@ impl GitEngine {
                 stderr.trim()
             )));
         }
-        let reset = run_git_logged(
+        let reset = run_git_logged_env(
             &self.env,
             &["reset", "--hard", "origin/HEAD"],
             repo_dir,
+            &lazy_fetch,
             sink,
         )?;
         if !reset.status.success() {
@@ -1124,6 +1135,7 @@ impl GitEngine {
     fn pull_latest_with(&self, repo_dir: &Path, fetch_args: &[&str]) -> Result<(), EngineError> {
         let fetch = host_command::command(&self.env, repo_dir)
             .args(fetch_args)
+            .env("GIT_NO_LAZY_FETCH", "0")
             .current_dir(repo_dir)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", fetch_args.join(" "))))?;
@@ -1137,6 +1149,7 @@ impl GitEngine {
         }
         let reset = host_command::command(&self.env, repo_dir)
             .args(["reset", "--hard", "origin/HEAD"])
+            .env("GIT_NO_LAZY_FETCH", "0")
             .current_dir(repo_dir)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git reset --hard origin/HEAD`: {e}")))?;

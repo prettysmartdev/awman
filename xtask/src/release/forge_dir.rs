@@ -799,6 +799,37 @@ impl Forge for DirForge {
         })
     }
 
+    fn progress_snapshot(&self, id: u64) -> Option<(RunInfo, Vec<JobInfo>)> {
+        let store = self.dir.load();
+        let run = store.runs.iter().find(|r| r.info.id == id)?;
+        let jobs = if run.info.workflow == "ci.yml" {
+            vec!["test (linux-x64-default)", "gate"]
+        } else {
+            vec!["produce", "validate"]
+        };
+        let jobs = jobs
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| JobInfo {
+                id: id * 10 + i as u64,
+                name: name.into(),
+                status: run.info.status.clone(),
+                conclusion: run.info.conclusion.clone(),
+                attempt: run.info.attempt,
+                failed_steps: vec![],
+                active_step: (run.info.status == "in_progress").then(|| {
+                    if i == 0 {
+                        "Build asset"
+                    } else {
+                        "Validate asset"
+                    }
+                    .into()
+                }),
+            })
+            .collect();
+        Some((run.info.clone(), jobs))
+    }
+
     fn jobs(&self, run_id: u64) -> Step<Vec<JobInfo>> {
         around(&self.dir, "jobs", || {
             self.dir.with(|s| {
@@ -842,6 +873,14 @@ impl Forge for DirForge {
                                 }
                                 _ => vec![],
                             },
+                            active_step: (r.info.status == "in_progress").then(|| {
+                                if i == 0 {
+                                    "Build asset"
+                                } else {
+                                    "Validate asset"
+                                }
+                                .into()
+                            }),
                         }
                     })
                     .collect())

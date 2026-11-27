@@ -159,7 +159,19 @@ changed seal is asked about again.
 
 ### Output and exit codes
 
-On any stop the command prints exactly two lines:
+The command flushes phase start, finish, resume and block events to the terminal,
+with elapsed time, version, short commit, phase log and timing ledger locations.
+During long phases it prints changed CI, asset, job and native status as it is
+observed, including Actions run links and active steps when available. A
+heartbeat appears at least every 30 seconds while a phase is running, including
+during a blocking service call. Evidence verification and draft reconciliation
+report each item; uploads include file sizes. The only private paths printed are
+the operator's phase log and timing ledger locations. Credentials, tokens, raw
+command output and other private paths remain in the private attempt state.
+The publication prompt has a prominent heading.
+
+On any stop, preceding progress messages are permitted. The final two lines
+are exactly one primary error and its recovery instruction:
 
 ```
 release: BLOCKED [linux-host-unreachable] ssh build@kvm1 timed out after 8 s
