@@ -462,7 +462,7 @@ impl TabRelay {
                     cols: self.pty_size.0,
                     rows: self.pty_size.1,
                 },
-                io.stdout_rx,
+                io.stdout_rx.into_unbounded(),
                 io.stdin_tx,
                 io.resize_tx,
             )),

@@ -938,6 +938,18 @@ If control is refused, attach prints one notice and continues watching read-only
 `--step` applies to command and task targets; a terminal ID already selects one
 specific terminal and cannot be combined with `--step`.
 
+A new attach also replays up to the last 256 KiB of that terminal's output,
+before showing its current screen. The visible history is limited by the viewer:
+the TUI uses `tui.scrollbackLines` (10,000 lines by default), while the CLI uses
+the host terminal's scrollback. The buffer discards the oldest bytes first. If
+any have been evicted, awman marks the replay as truncated and shows the notice
+“earlier output was not retained; scrollback starts later”. It may trim the
+replay's beginning to a safe terminal boundary. Terminal output history is kept
+in memory; a daemon restart removes it. Redraw-heavy full-screen programs can
+leave noisy scrollback. If a program
+is still using the alternate screen and the replay is truncated, awman skips
+the history and shows its current screen instead.
+
 Use repeatable `--annotation namespace/name=value` options to label a viewer
 subscription, for example `--annotation rex/block=blk_42`. Keys use lowercase
 letters, digits, dots, and hyphens around one `/`; values cannot contain

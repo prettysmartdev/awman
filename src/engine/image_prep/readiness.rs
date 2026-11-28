@@ -2,9 +2,7 @@
 //! These run inside the preflight's bounded probe workers. They never provision
 //! recipes, take build leases, acquire images or alter pending-build receipts.
 use super::*;
-use crate::data::image_inputs::{
-    agent_inputs_hash, project_inputs_at, DirBuildContext, InputsHash,
-};
+use crate::data::image_inputs::{project_inputs_at, DirBuildContext, InputsHash};
 use crate::data::image_tags::project_image_tag;
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::{preview_agent_dockerfile, AgentRegistry};
@@ -119,7 +117,12 @@ impl AgentImagePreparer {
             let Some(bytes) = self.preview_recipe(agent, &project_tag)? else {
                 return Ok(Some(format!("image {tag} requires its agent Dockerfile to be downloaded before freshness can be checked")));
             };
-            let expected = agent_inputs_hash(&bytes, &project.id);
+            let expected = crate::data::image_inputs::agent_inputs_hash_in(
+                &self.context.git_root,
+                agent,
+                &bytes,
+                &project.id,
+            );
             return Ok(self.freshness(tag, &expected)?.preparation_reason(tag));
         }
 
@@ -177,7 +180,12 @@ impl AgentImagePreparer {
             let Some(bytes) = self.preview_recipe(agent, &project_tag)? else {
                 return Ok(Some(format!("image {tag} requires its agent Dockerfile before source freshness can be checked")));
             };
-            let expected = agent_inputs_hash(&bytes, &parent.id);
+            let expected = crate::data::image_inputs::agent_inputs_hash_in(
+                &self.context.git_root,
+                agent,
+                &bytes,
+                &parent.id,
+            );
             let image = ImageFreshness::from_image(
                 builder.inspect_metadata(&target, &source.reference, &control)?,
                 &expected,

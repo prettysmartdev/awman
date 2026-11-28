@@ -242,6 +242,27 @@ impl TaskGateway for DaemonSquadClient {
             Err(e) => Err(e),
         }
     }
+    async fn run_workflow(
+        &self,
+        name: &str,
+        run: &crate::data::fs::task_store::RunId,
+    ) -> Result<crate::data::fs::RunWorkflow, CommandError> {
+        let task = self.resolve(name).await?;
+        self.request(
+            reqwest::Method::GET,
+            &[
+                "squad",
+                "tasks",
+                task.id.as_str(),
+                "runs",
+                run.as_str(),
+                "workflow",
+            ],
+            &[],
+            None,
+        )
+        .await
+    }
 
     async fn run_terminals(
         &self,

@@ -95,6 +95,11 @@ pub struct Task {
     /// `None` means the task has never run.
     #[serde(default)]
     pub last_run_status: Option<RunStatus>,
+    /// The [`RunPhase`] of the most recent run (WI 0105). Derived from the run
+    /// row exactly like [`last_run_status`](Self::last_run_status), and only
+    /// ever set while that status is [`RunStatus::Running`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_phase: Option<RunPhase>,
     /// Declared `env(NAME)` values the squad daemon has no value for (WI 0116).
     ///
     /// Derived, never stored — exactly like [`last_run_status`](Self::last_run_status),
@@ -254,6 +259,39 @@ impl RunStatus {
     }
 }
 
+/// What an in-flight run is doing right now, alongside [`RunStatus::Running`]
+/// (WI 0105).
+///
+/// A phase is never a status: a run with a phase is still `running`, so
+/// current-run lookup, cancellation, attach admission and orphan recovery do
+/// not need to know about it. Only a running run has one; finishing or
+/// reconciling a run clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunPhase {
+    /// A container image the run needs is actually being built. Reusing an
+    /// installed image is never this phase.
+    Building,
+}
+
+impl RunPhase {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Building => "building",
+        }
+    }
+
+    /// `NULL` (not in a phase, or a row written before the column existed) and
+    /// a name written by a newer binary both read as no phase: the phase only
+    /// refines `running`, so not knowing it is never an error.
+    fn from_db(value: Option<&str>) -> Option<Self> {
+        match value {
+            Some("building") => Some(Self::Building),
+            _ => None,
+        }
+    }
+}
+
 /// Terminal detail supplied when a run finishes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunDetail {
@@ -310,6 +348,15 @@ pub struct Run {
     /// gate.
     #[serde(default)]
     pub unmet_env: Vec<String>,
+    /// What the run is doing while its status is [`RunStatus::Running`]
+    /// (WI 0105). `None` for every finished run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<RunPhase>,
+    /// Why this run used an out-of-date image: a refresh failed and the
+    /// previously installed one was kept (WI 0105). Several kept images are
+    /// one per line. Kept after the run finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_warning: Option<String>,
 }
 
 /// SQLite-backed task store. The squad daemon is its only constructor.
@@ -438,6 +485,10 @@ impl TaskStore {
         // The leader verdict's free-text `reason`. `NULL` for rows written
         // before this column existed and for runs that never reached a verdict.
         Self::add_column_if_missing(conn, "squad_runs", "reason", "TEXT")?;
+        // WI 0105: the in-flight phase of a running run, and the stale-image
+        // warning a run keeps. `NULL` for every row written before them.
+        Self::add_column_if_missing(conn, "squad_runs", "phase", "TEXT")?;
+        Self::add_column_if_missing(conn, "squad_runs", "image_warning", "TEXT")?;
         crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
@@ -514,7 +565,10 @@ impl TaskStore {
                         backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                         (SELECT r.status FROM squad_runs r
                           WHERE r.task_id = squad_tasks.id
-                          ORDER BY r.started_at DESC LIMIT 1), prerequisites
+                          ORDER BY r.started_at DESC LIMIT 1), prerequisites,
+                        (SELECT r.phase FROM squad_runs r
+                          WHERE r.task_id = squad_tasks.id
+                          ORDER BY r.started_at DESC LIMIT 1)
                  FROM squad_tasks WHERE name = ?1",
                 [name],
                 task_from_row,
@@ -533,7 +587,10 @@ impl TaskStore {
                     backoff_until, created_at, updated_at, last_run_at, trigger_requested_at,
                     (SELECT r.status FROM squad_runs r
                       WHERE r.task_id = squad_tasks.id
-                      ORDER BY r.started_at DESC LIMIT 1), prerequisites
+                      ORDER BY r.started_at DESC LIMIT 1), prerequisites,
+                    (SELECT r.phase FROM squad_runs r
+                      WHERE r.task_id = squad_tasks.id
+                      ORDER BY r.started_at DESC LIMIT 1)
              FROM squad_tasks ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map([], task_from_row)?;
@@ -672,7 +729,10 @@ impl TaskStore {
                     c.last_run_at, c.trigger_requested_at,
                     (SELECT r2.status FROM squad_runs r2
                       WHERE r2.task_id = c.id
-                      ORDER BY r2.started_at DESC LIMIT 1), c.prerequisites
+                      ORDER BY r2.started_at DESC LIMIT 1), c.prerequisites,
+                    (SELECT r2.phase FROM squad_runs r2
+                      WHERE r2.task_id = c.id
+                      ORDER BY r2.started_at DESC LIMIT 1)
              FROM squad_tasks c
              WHERE c.status = 'active'
                AND (c.trigger_requested_at IS NOT NULL
@@ -739,6 +799,10 @@ impl TaskStore {
         Ok(id)
     }
 
+    /// Close a running run. A workflow path already recorded by
+    /// [`set_workflow_state_path`](Self::set_workflow_state_path) is kept when
+    /// `detail` carries none, so a canceled or failed run keeps the record of
+    /// the workflow it was executing. Any [`RunPhase`] is cleared.
     pub fn finish_run(
         &self,
         run_id: &RunId,
@@ -749,8 +813,9 @@ impl TaskStore {
         let conn = self.lock();
         Ok(conn.execute(
             "UPDATE squad_runs
-             SET status = ?1, workflow_path = ?2, workflow_state_path = ?3, error = ?4, finished_at = ?5,
-                 reason = ?6
+             SET status = ?1, workflow_path = COALESCE(?2, workflow_path),
+                 workflow_state_path = COALESCE(?3, workflow_state_path), error = ?4,
+                 finished_at = ?5, reason = ?6, phase = NULL
              WHERE id = ?7 AND status = 'running'",
             params![
                 status.as_db(),
@@ -794,12 +859,48 @@ impl TaskStore {
         Ok(())
     }
 
+    /// Enter (`Some`) or leave (`None`) a phase of a running run.
+    ///
+    /// Only a row that is still `running` is touched, so a late report can
+    /// never put a phase back on a finished run. Returns whether a row
+    /// changed.
+    pub fn set_run_phase(
+        &self,
+        run_id: &RunId,
+        phase: Option<RunPhase>,
+    ) -> Result<bool, DataError> {
+        let conn = self.lock();
+        Ok(conn.execute(
+            "UPDATE squad_runs SET phase = ?1 WHERE id = ?2 AND status = 'running'",
+            params![phase.map(RunPhase::as_db), run_id.as_str()],
+        )? > 0)
+    }
+
+    /// Record that a running run kept an out-of-date image. Each distinct
+    /// warning is added on its own line; repeating one changes nothing.
+    pub fn set_run_image_warning(&self, run_id: &RunId, warning: &str) -> Result<(), DataError> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE squad_runs
+             SET image_warning = CASE
+                     WHEN image_warning IS NULL THEN ?1
+                     WHEN instr(char(10) || image_warning || char(10),
+                                char(10) || ?1 || char(10)) > 0 THEN image_warning
+                     ELSE image_warning || char(10) || ?1
+                 END
+             WHERE id = ?2 AND status = 'running'",
+            params![warning, run_id.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// The most recent runs for a task, newest first.
     pub fn runs_for(&self, name: &str, limit: usize) -> Result<Vec<Run>, DataError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT r.id, r.task_id, r.status, r.workflow_path, r.workflow_state_path,
-                    r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env, r.reason
+                    r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env, r.reason,
+                    r.phase, r.image_warning
              FROM squad_runs r
              JOIN squad_tasks c ON c.id = r.task_id
              WHERE c.name = ?1
@@ -826,7 +927,7 @@ impl TaskStore {
         let raw = conn
             .query_row(
                 "SELECT id, task_id, status, workflow_path, workflow_state_path, session_id, started_at,
-                        finished_at, error, unmet_env, reason
+                        finished_at, error, unmet_env, reason, phase, image_warning
                  FROM squad_runs WHERE task_id = ?1 AND status = 'running'
                  ORDER BY started_at DESC LIMIT 1",
                 [task_id],
@@ -840,7 +941,7 @@ impl TaskStore {
         let conn = self.lock();
         Ok(conn.execute(
             "UPDATE squad_runs
-             SET status = 'interrupted', finished_at = ?1,
+             SET status = 'interrupted', finished_at = ?1, phase = NULL,
                  error = 'daemon restarted while this run was in flight'
              WHERE status = 'running'",
             [timestamp(now)],
@@ -867,6 +968,7 @@ struct RawTask {
     last_run_at: Option<String>,
     trigger_requested_at: Option<String>,
     last_run_status: Option<String>,
+    last_run_phase: Option<String>,
 }
 
 fn task_from_row(row: &Row<'_>) -> rusqlite::Result<RawTask> {
@@ -888,6 +990,7 @@ fn task_from_row(row: &Row<'_>) -> rusqlite::Result<RawTask> {
         last_run_at: row.get(13)?,
         trigger_requested_at: row.get(14)?,
         last_run_status: row.get(15)?,
+        last_run_phase: row.get(17)?,
     })
 }
 
@@ -924,6 +1027,7 @@ fn task_from_raw(raw: RawTask) -> Result<Task, DataError> {
             .as_deref()
             .map(RunStatus::from_db)
             .transpose()?,
+        last_run_phase: RunPhase::from_db(raw.last_run_phase.as_deref()),
         // Derived by the daemon's gateway, never by the store: there is no
         // column behind it and there deliberately is not one.
         unmet_env: Vec::new(),
@@ -951,6 +1055,8 @@ struct RawRun {
     error: Option<String>,
     unmet_env: Option<String>,
     reason: Option<String>,
+    phase: Option<String>,
+    image_warning: Option<String>,
 }
 
 fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
@@ -966,6 +1072,8 @@ fn run_from_row(row: &Row<'_>) -> rusqlite::Result<RawRun> {
         error: row.get(8)?,
         unmet_env: row.get(9)?,
         reason: row.get(10)?,
+        phase: row.get(11)?,
+        image_warning: row.get(12)?,
     })
 }
 
@@ -982,6 +1090,8 @@ fn run_from_raw(raw: RawRun) -> Result<Run, DataError> {
         error: raw.error,
         reason: raw.reason,
         unmet_env: decode_names(raw.unmet_env.as_deref())?,
+        phase: RunPhase::from_db(raw.phase.as_deref()),
+        image_warning: raw.image_warning,
     })
 }
 
@@ -1051,3 +1161,6 @@ fn encode_prerequisites(
         .transpose()
         .map_err(|source| DataError::ConfigSerialize { source })
 }
+
+#[cfg(test)]
+mod run_phase_tests;

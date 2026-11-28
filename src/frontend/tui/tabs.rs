@@ -35,6 +35,8 @@ pub use crate::data::instance_snapshot::{
 
 mod container_slots;
 mod git_poll;
+#[cfg(test)]
+mod history_replay_tests;
 mod labels;
 mod overlay_lifecycle;
 pub mod squad_state;
@@ -183,8 +185,11 @@ pub struct ContainerSlot {
     pub step_name: String,
     pub vt100_parser: vt100::Parser,
     pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
+    /// Alternate-screen stripping state carried across output chunks, so a
+    /// switch split by a frame boundary is still recognised.
+    pub(crate) alt_stripper: AltScreenStripper,
     pub container_info: Option<ContainerInfo>,
-    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    pub container_stdout_rx: Option<crate::command::instance::feeds::SlotOutputRx>,
     pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
     /// Whether the agent has requested the alternate screen buffer. Tracked
@@ -213,6 +218,7 @@ impl ContainerSlot {
     /// Install one launch's channels as a unit; input and resize must target
     /// the same execution that supplies this slot's output.
     pub fn bind_io(&mut self, io: ContainerSlotIo) {
+        self.alt_stripper = AltScreenStripper::default();
         self.container_stdout_rx = Some(io.stdout_rx);
         self.container_stdin_tx = Some(io.stdin_tx);
         self.container_resize_tx = Some(io.resize_tx);
@@ -238,6 +244,7 @@ impl ContainerSlot {
             step_name,
             vt100_parser: vt100::Parser::new(24, 80, scrollback),
             region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
+            alt_stripper: AltScreenStripper::default(),
             container_info: Some(ContainerInfo {
                 agent_display_name,
                 container_name: String::new(),
@@ -798,6 +805,48 @@ pub fn compute_tab_bar_width(num_tabs: usize, area_width: u16, max_natural_conte
         natural
     } else {
         (area_width / n).max(12)
+    }
+}
+
+/// [`strip_alternate_screen_sequences`] across a stream of chunks. A chunk
+/// that ends inside one of the recognised sequences (at most 7 bytes) keeps
+/// that tail back and joins it to the next chunk, so frame boundaries (16 KiB
+/// history frames, live output splits) never let a switch reach the parser.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AltScreenStripper {
+    carry: Vec<u8>,
+}
+
+impl AltScreenStripper {
+    const SEQUENCES: &'static [&'static [u8]] = &[
+        b"\x1b[?1049h",
+        b"\x1b[?47h",
+        b"\x1b[?1047h",
+        b"\x1b[?1049l",
+        b"\x1b[?47l",
+        b"\x1b[?1047l",
+        b"\x1b[?1007h",
+        b"\x1b[?1007l",
+    ];
+
+    fn strip(&mut self, input: &[u8]) -> StrippedOutput {
+        let mut joined = std::mem::take(&mut self.carry);
+        joined.extend_from_slice(input);
+        // Hold back a tail that is a proper prefix of a recognised sequence.
+        let keep_from = joined
+            .iter()
+            .rposition(|&b| b == 0x1b)
+            .filter(|&at| joined.len() - at < 8)
+            .filter(|&at| {
+                let tail = &joined[at..];
+                Self::SEQUENCES
+                    .iter()
+                    .any(|seq| seq.len() > tail.len() && seq.starts_with(tail))
+            });
+        if let Some(at) = keep_from {
+            self.carry = joined.split_off(at);
+        }
+        strip_alternate_screen_sequences(&joined)
     }
 }
 

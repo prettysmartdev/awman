@@ -1,1 +1,2 @@
-//! engine::image_prep component tests (filled in by slice-layer1-engine).
+//! engine::image_prep component tests.
+mod squad_image_inputs;

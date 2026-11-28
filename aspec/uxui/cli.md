@@ -490,11 +490,15 @@ that image's resolved source, then imports from that same source. Registry,
 archive, remote Docker, and unconfigured sources do not select a builder.
 Incompatible requested builds warn and retain normal source import behavior.
 API session setup may build a missing compatible-source image. `chat`,
-`exec prompt`, workflow preflight (static and dynamic) and squad evaluation
-only import from the selected source and never build. The workflow prerequisite
-review reports pending preparation using the same input hashes, including
-generated recipes and project-image dependencies. With the builder disabled a
-launch never acquires.
+`exec prompt`, workflow preflight (static and dynamic), and squad evaluation
+acquire images from the selected source and never build through builtin. On
+Docker and Apple Containers, squad evaluation prepares its task-pool images
+before the leader starts, reusing fresh images and rebuilding stale or
+unlabelled ones. A failed refresh keeps the installed image and records a
+stale-image warning for the run. The workflow prerequisite review reports
+pending preparation using the same input hashes, including generated recipes
+and project-image dependencies. With the builder disabled a launch never
+acquires.
 These checks re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
 would have accepted. Like `ready`, they refuse to import a default source that
@@ -610,6 +614,28 @@ Deletion requires inactive state under the lease. Close is idempotent for inacti
 profiles; it cannot displace a live awman lease. Runtime uncertainty preserves
 closing state, blocking both deletion and another writer.
 
+### Squad task image preparation
+
+Directory tasks build from their task-owned workspace at
+`<data home>/squad/tasks/<name>/workspace`: `Dockerfile.dev` and
+`.awman/Dockerfile.<agent>` live there, and the workspace is mounted in task
+containers at `/awman/context/workflow`. A custom non-Git task also mounts its
+chosen directory at `/workspace`, but does not build from or write recipes to
+that directory. Safe legacy recipes and local inputs are copied into the task
+workspace once; later edits to the old locations are ignored. Task-owned
+recipes can be edited directly, and changes take effect during the next run's
+image preparation. Squad does not refresh directory-task images again during
+that run's generated workflow. The task-specific tags are shared by runs with
+the same task name, so another awman process preparing that task can update a
+tag while a run is active.
+
+Docker and Apple Containers reuse fresh images and rebuild stale or unlabelled
+images. Missing images are built. If rebuilding an existing image fails, the
+run keeps that image and records a stale-image warning. The Squad card and run
+details show `building` only while an image is being built, then `running`; a
+reused image does not produce a building phase. Run history marks a retained
+stale image with a warning indicator and its detail explains the failure.
+
 ### Squad terminal startup
 
 `squad attach <task>` uses the same daemon terminal viewer as `attach task_…`,
@@ -622,4 +648,15 @@ start…”. Idle/unknown tasks, invalid known selectors, daemon and unrelated
 transport failures fail directly. Cancellation, run completion/replacement and
 timeout produce explicit outcomes. CLI and TUI consume this Layer 2 decision;
 they never perform independent runtime discovery. On the Squad tab, Ctrl-\\
-and Ctrl-C end only the local viewer and restore the card grid.
+and Ctrl-C end only the local viewer and restore the card grid. The TUI follower
+stays pinned to that run as the evaluation leader hands off to workflow
+terminals; it does not follow a later task run.
+
+### Squad run history
+
+Opening a run in Squad history shows its saved workflow steps, setup and teardown
+phases, dependencies, and recorded outcomes in the run-detail modal. Up/Down and
+Page Up/Page Down scroll the detail; Left/Right pan a wide workflow. Runs without
+a workflow say so. If the run's saved state was removed or cannot be read or
+understood, the detail reports that it is unavailable while keeping the run's
+reason and error visible.

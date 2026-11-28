@@ -104,6 +104,7 @@ including parallel branches and joins. Use the examples for syntax; choose the
 steps and dependencies from this run's actual work.
 If an `example-workflow.toml` remains from an older awman version, ignore it;
 the Markdown reference is current.
+{{image_recipes}}
 
 ### Treat a previous run's `workflow.toml` as a stale draft
 

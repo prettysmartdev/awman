@@ -38,6 +38,10 @@ pub struct BuildRequest {
     /// Docker runtime's builds.
     pub build_args: Vec<(String, String)>,
     pub no_cache: bool,
+    /// Cancels the build: the host CLI runner kills and reaps the builder
+    /// process when it fires, so a cancelled run never leaves one running
+    /// (or publishing an image) behind. Default: never cancelled.
+    pub cancel: crate::engine::oci::CancelToken,
 }
 
 impl BuildRequest {
@@ -52,6 +56,7 @@ impl BuildRequest {
             platform: OciPlatform::host_linux(),
             build_args: Vec::new(),
             no_cache,
+            cancel: Default::default(),
         }
     }
 

@@ -36,6 +36,7 @@ pub mod private_files;
 pub mod remote_slug;
 pub mod repo_file;
 pub mod repo_tree;
+pub mod run_workflow;
 pub mod safe_tree;
 pub mod schema_version;
 pub mod skill_dirs;
@@ -63,6 +64,10 @@ pub use kit_paths::SandboxKitPaths;
 pub use log_dirs::WorkflowLogPaths;
 pub use overlay_paths::OverlayPathResolver;
 pub use panic_log::PanicLog;
+pub use run_workflow::{
+    project_run_workflow, project_workflow_state, RunDag, RunDagNode, RunDagNodeKind,
+    RunDagOutcome, RunWorkflow, RunWorkflowUnavailable,
+};
 pub use skill_dirs::SkillDirs;
 pub use squad_paths::{SharedSquadRunLog, SquadPaths, SquadRunLog, SquadRunLogError, SquadRunLogs};
 pub use squad_run_paths::SquadRunPaths;

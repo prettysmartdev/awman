@@ -275,8 +275,23 @@ impl TerminalOperations {
         id: &TerminalId,
         viewer: ViewerIdentity,
     ) -> Result<TerminalSession, TerminalRefusal> {
+        self.open_with(
+            id,
+            viewer,
+            crate::engine::terminal_hub::SubscribeOptions::default(),
+        )
+    }
+
+    /// [`Self::open`] with subscription options (`?history=true`). History
+    /// frames are admitted by the same per-frame recheck as output.
+    pub fn open_with(
+        self: &Arc<Self>,
+        id: &TerminalId,
+        viewer: ViewerIdentity,
+        options: crate::engine::terminal_hub::SubscribeOptions,
+    ) -> Result<TerminalSession, TerminalRefusal> {
         let record = self.get(id, &viewer)?;
-        let subscription = self.hub.subscribe(id)?;
+        let subscription = self.hub.subscribe_with(id, options)?;
         Ok(TerminalSession::new(
             record,
             viewer,

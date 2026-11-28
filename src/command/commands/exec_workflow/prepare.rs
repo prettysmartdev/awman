@@ -285,6 +285,7 @@ pub(crate) async fn execute_prepared_with_outputs(
     mut frontend: SharedWorkflowFrontend,
     squad_identity: Option<&crate::engine::squad::launcher::SquadContainerIdentity>,
     task_workspace: Option<&Path>,
+    image_root: Option<&Path>,
     workflow_state_root: Option<&Path>,
     managed_session: Option<&Arc<tokio::sync::RwLock<Session>>>,
     cancel: &tokio_util::sync::CancellationToken,
@@ -635,7 +636,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                 state_root: workflow_state_root.map(Path::to_path_buf),
                 image: resolve_phase_image(
                     &session,
-                    &git_root_for_scope,
+                    image_root.unwrap_or(&git_root_for_scope),
                     engines.runtime.capabilities().image_acquisition,
                 ),
                 cli_overlays: phase_cli_typed.clone(),
@@ -657,7 +658,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         if !setup_steps.is_empty() && !engine.state().setup_completed {
             let base_image = resolve_phase_image(
                 &session,
-                &git_root_for_scope,
+                image_root.unwrap_or(&git_root_for_scope),
                 engines.runtime.capabilities().image_acquisition,
             );
             let mut resolved = resolve_phase_overlays(
@@ -838,7 +839,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             if should_run {
                 let base_image = resolve_phase_image(
                     &session,
-                    &git_root_for_scope,
+                    image_root.unwrap_or(&git_root_for_scope),
                     engines.runtime.capabilities().image_acquisition,
                 );
                 // Re-check the prerequisites without prompting (WI 0149 §3):

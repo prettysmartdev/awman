@@ -27,6 +27,11 @@ pub struct SquadSnapshot {
     pub error: Option<String>,
     /// False until the first poll (success or failure) has completed.
     pub loaded: bool,
+    /// Historical workflow result tagged with its run identity.
+    pub run_workflow: Option<(
+        crate::data::fs::task_store::RunId,
+        Result<crate::data::fs::RunWorkflow, String>,
+    )>,
 }
 
 /// Cross-thread snapshot handle: the poll task writes, the renderer reads.
@@ -36,6 +41,12 @@ pub type SharedSquadSnapshot = Arc<Mutex<SquadSnapshot>>;
 /// `App::tick_all_tabs` writes it from `SquadTabState::selected_name()`; the
 /// poll task reads it, so the poller never touches UI state directly.
 pub type SharedSelected = Arc<Mutex<Option<String>>>;
+
+/// The presenter owns the view even when the engine lives in the daemon.
+pub struct SquadAttachView {
+    pub generation: u64,
+    pub task: String,
+}
 
 /// Squad sub-view state (selection, polled tasks, daemon reachability).
 /// `Some` exactly when the owning `Tab` is the squad tab.
@@ -77,12 +88,15 @@ pub struct SquadTabState {
     /// Shared with the command frontend so Dispatch can own the attach loop
     /// while the tab retains presentation-level detach/close control.
     pub attach_session: Arc<SquadAttachSession>,
+    pub attach_view: Option<SquadAttachView>,
     /// Written by the attach driver; drives the "daemon not reachable"
     /// indicator without tearing down live slots.
     pub daemon_reachable: Arc<AtomicBool>,
     /// Selected task name, published by `tick_all_tabs` and read by the
     /// poll task (see [`SharedSelected`]).
     pub poll_selected: SharedSelected,
+    pub run_workflow_request: Arc<Mutex<Option<(String, crate::data::fs::task_store::RunId)>>>,
+    pub poll_wake: Arc<tokio::sync::Notify>,
 }
 
 impl SquadTabState {
@@ -96,8 +110,11 @@ impl SquadTabState {
             cancel: cancel.clone(),
             poll_handle: None,
             attach_session: Arc::new(SquadAttachSession::new(cancel.clone())),
+            attach_view: None,
             daemon_reachable: Arc::new(AtomicBool::new(true)),
             poll_selected: Arc::new(Mutex::new(None)),
+            run_workflow_request: Arc::new(Mutex::new(None)),
+            poll_wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
 

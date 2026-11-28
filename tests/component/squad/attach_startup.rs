@@ -130,6 +130,7 @@ impl Fixture {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            last_run_phase: None,
             unmet_env: vec![],
             prerequisites: None,
         };
@@ -146,6 +147,8 @@ impl Fixture {
                 error: None,
                 reason: None,
                 unmet_env: vec![],
+                phase: None,
+                image_warning: None,
             }],
             ..State::default()
         }));

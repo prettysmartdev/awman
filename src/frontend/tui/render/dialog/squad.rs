@@ -4,6 +4,7 @@
 //! dialog variant, so the 1,700-line `match` in `render_dialog` is one call
 //! per arm.
 
+use super::super::squad::run_status_label;
 use super::super::*;
 use crate::command::commands::squad::commands::SquadConfirmDecision;
 use crate::data::prompt::Prompt;
@@ -141,8 +142,16 @@ pub(crate) fn render_squad_detail(
         TaskStatus::Active => "active",
         TaskStatus::Paused => "paused",
     };
-    let mut fields: Vec<Line> = vec![
-        squad_field_line("Status", status),
+    let mut fields: Vec<Line> = vec![squad_field_line("Status", status)];
+    // The most recent run, live: `building`, then `running`, then its final
+    // outcome. Absent for a task that has never run.
+    if let Some(run_status) = c.last_run_status {
+        fields.push(squad_field_line(
+            "Last run",
+            run_status_label(run_status, c.last_run_phase),
+        ));
+    }
+    fields.extend([
         squad_field_line("Mount scope", mount),
         squad_field_line(
             "Interval",
@@ -175,7 +184,7 @@ pub(crate) fn render_squad_detail(
             "Updated",
             &c.updated_at.format("%Y-%m-%d %H:%M").to_string(),
         ),
-    ];
+    ]);
     // WI 0116 §6b — the same standing marker the card carries, in the field
     // block that already reads as a labelled record. Absent when there is
     // nothing to say, so the modal is unchanged for a fully-covered task.
@@ -388,7 +397,16 @@ fn render_squad_run_detail(state: &dialogs::SquadRunDetailState, area: Rect, fra
     if !run.unmet_env.is_empty() {
         lines.push(squad_field_line("Unmet env", &run.unmet_env.join(", ")));
     }
-    for (label, text) in [("Reason", &run.reason), ("Error", &run.error)] {
+    // A kept out-of-date image is shown only when there is one; Reason and
+    // Error always have their sections.
+    let warning = run
+        .image_warning
+        .is_some()
+        .then_some(("Image warning", &run.image_warning));
+    for (label, text) in warning
+        .into_iter()
+        .chain([("Reason", &run.reason), ("Error", &run.error)])
+    {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("{label}:"),
@@ -407,6 +425,9 @@ fn render_squad_run_detail(state: &dialogs::SquadRunDetailState, area: Rect, fra
             ))),
         }
     }
+
+    let dag_start = lines.len();
+    append_run_workflow_lines(&mut lines, &state.workflow);
 
     // `+ 2`: a blank separator row and the key-hint row under the text.
     let max_height = area.height.saturating_sub(4).clamp(8, 40);
@@ -430,12 +451,44 @@ fn render_squad_run_detail(state: &dialogs::SquadRunDetailState, area: Rect, fra
     let max_scroll = lines.len().saturating_sub(body.height as usize);
     state.max_scroll.set(max_scroll);
     let scroll = state.scroll.min(max_scroll);
+    let visible_w = body.width as usize;
+    let max_width = lines
+        .iter()
+        .skip(dag_start)
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(visible_w);
+    let max_hscroll = if max_width > visible_w {
+        max_width.saturating_sub(visible_w.saturating_sub(2))
+    } else {
+        0
+    };
+    state.max_hscroll.set(max_hscroll);
+    let hscroll = state.hscroll.min(max_hscroll);
+    if hscroll > 0 || max_hscroll > 0 {
+        let marker = Style::default().fg(Color::DarkGray);
+        for line in lines.iter_mut().skip(dag_start) {
+            let width = line.width();
+            let mut cropped = crop_line(line, hscroll, visible_w.saturating_sub(2));
+            cropped
+                .spans
+                .insert(0, Span::styled(if hscroll > 0 { "‹" } else { " " }, marker));
+            if width > hscroll + visible_w.saturating_sub(2) {
+                cropped.spans.push(Span::styled("›", marker));
+            }
+            *line = cropped;
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         body,
     );
 
-    let hint_text = if max_scroll > 0 {
+    let hint_text = if max_scroll > 0 && max_hscroll > 0 {
+        "\u{2191}/\u{2193} scroll \u{b7} \u{2190}/\u{2192} pan \u{b7} esc back to history"
+    } else if max_hscroll > 0 {
+        "\u{2190}/\u{2192} pan \u{b7} esc back to history"
+    } else if max_scroll > 0 {
         "\u{2191}/\u{2193} scroll \u{b7} esc back to history"
     } else {
         "esc back to history"
@@ -447,6 +500,159 @@ fn render_squad_run_detail(state: &dialogs::SquadRunDetailState, area: Rect, fra
         )),
         hint,
     );
+}
+
+fn append_run_workflow_lines(lines: &mut Vec<Line<'static>>, load: &dialogs::RunWorkflowLoad) {
+    use crate::data::fs::{RunDagNodeKind, RunDagOutcome, RunWorkflow, RunWorkflowUnavailable};
+    let unavailable = |reason: RunWorkflowUnavailable| match reason {
+        RunWorkflowUnavailable::Missing => {
+            "Workflow state is no longer available for this run.".to_string()
+        }
+        RunWorkflowUnavailable::Unreadable => {
+            "Workflow state for this run could not be shown (unreadable).".to_string()
+        }
+        RunWorkflowUnavailable::Incompatible => {
+            "Workflow state for this run could not be shown (incompatible schema).".to_string()
+        }
+        RunWorkflowUnavailable::Mismatch => {
+            "Workflow state for this run could not be shown (run identity mismatch).".to_string()
+        }
+    };
+    match load {
+        dialogs::RunWorkflowLoad::Loading => lines.push(Line::from(Span::styled(
+            "Workflow: Loading workflow…",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        dialogs::RunWorkflowLoad::Failed(error) => lines.push(Line::from(Span::styled(
+            format!("Workflow unavailable: {error}"),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        dialogs::RunWorkflowLoad::Loaded(RunWorkflow::NoWorkflow) => {
+            lines.push(Line::from(Span::styled(
+                "Workflow: This run did not execute a workflow.",
+                Style::default().fg(Color::DarkGray),
+            )))
+        }
+        dialogs::RunWorkflowLoad::Loaded(RunWorkflow::Unavailable { reason }) => {
+            lines.push(Line::from(Span::styled(
+                unavailable(*reason),
+                Style::default().fg(Color::DarkGray),
+            )))
+        }
+        dialogs::RunWorkflowLoad::Loaded(RunWorkflow::Dag(dag)) => {
+            lines.push(Line::from(Span::styled(
+                format!("Workflow: {}", dag.workflow_name),
+                Style::default().fg(Color::Cyan),
+            )));
+            for (kind, title) in [
+                (RunDagNodeKind::Setup, "setup"),
+                (RunDagNodeKind::Step, ""),
+                (RunDagNodeKind::Teardown, "teardown"),
+            ] {
+                let mut selected = dag
+                    .nodes
+                    .iter()
+                    .filter(|node| node.kind == kind)
+                    .collect::<Vec<_>>();
+                // Stable: definition order is kept within a stage, so a DAG
+                // from a daemon that did not order its nodes still groups.
+                selected.sort_by_key(|node| node.stage);
+                if selected.is_empty() {
+                    continue;
+                }
+                if !title.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {title}"),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                let mut current_stage = None;
+                for node in selected {
+                    if kind == RunDagNodeKind::Step && current_stage != Some(node.stage) {
+                        current_stage = Some(node.stage);
+                        lines.push(Line::from(Span::styled(
+                            format!("  stage {}", node.stage + 1),
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    }
+                    let (glyph, status_style) = match node.outcome {
+                        RunDagOutcome::Pending => {
+                            crate::frontend::tui::workflow_view::step_status_glyph_and_style(
+                                crate::frontend::tui::tabs::StepViewStatus::Pending,
+                            )
+                        }
+                        RunDagOutcome::Running => {
+                            crate::frontend::tui::workflow_view::step_status_glyph_and_style(
+                                crate::frontend::tui::tabs::StepViewStatus::Running,
+                            )
+                        }
+                        RunDagOutcome::Succeeded => {
+                            crate::frontend::tui::workflow_view::step_status_glyph_and_style(
+                                crate::frontend::tui::tabs::StepViewStatus::Done,
+                            )
+                        }
+                        RunDagOutcome::Failed => {
+                            crate::frontend::tui::workflow_view::step_status_glyph_and_style(
+                                crate::frontend::tui::tabs::StepViewStatus::Error,
+                            )
+                        }
+                        RunDagOutcome::Cancelled => {
+                            crate::frontend::tui::workflow_view::step_status_glyph_and_style(
+                                crate::frontend::tui::tabs::StepViewStatus::Cancelled,
+                            )
+                        }
+                        RunDagOutcome::Unfinished => ("–", Style::default().fg(Color::Yellow)),
+                    };
+                    let identity = node
+                        .agent
+                        .as_deref()
+                        .map(|agent| match node.model.as_deref() {
+                            Some(model) => format!(" {agent}/{model}"),
+                            None => format!(" {agent}"),
+                        })
+                        .unwrap_or_default();
+                    let dependencies = if node.depends_on.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  ← {}", node.depends_on.join(", "))
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("    {glyph} "), status_style),
+                        Span::styled(node.name.clone(), Style::default().fg(Color::White)),
+                        Span::styled(identity, Style::default().fg(Color::DarkGray)),
+                        Span::styled(dependencies, Style::default().fg(Color::DarkGray)),
+                    ]));
+                }
+            }
+        }
+    }
+}
+
+/// Crop `line` to the display columns `offset..offset + width`, keeping
+/// each span's style (outcome glyph colours, headings) intact.
+fn crop_line(line: &Line<'_>, offset: usize, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut column = 0usize;
+    let mut taken = 0usize;
+    for span in &line.spans {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if column < offset {
+                column += cw;
+                continue;
+            }
+            if taken + cw > width {
+                break;
+            }
+            text.push(ch);
+            taken += cw;
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+    }
+    Line::from(spans).style(line.style)
 }
 
 /// A `label: value` line for the detail modal's field block.
@@ -597,12 +803,15 @@ fn squad_history_headers(show_unmet: bool) -> Vec<&'static str> {
 fn squad_history_cells(run: &crate::data::fs::task_store::Run, show_unmet: bool) -> Vec<String> {
     use crate::data::fs::task_store::RunStatus;
     let status = match run.status {
-        RunStatus::Running => "running",
-        RunStatus::NotTriggered => "not triggered",
+        // The table's status column is too narrow for the card's wording.
         RunStatus::WorkflowExecuted => "executed",
-        RunStatus::Failed => "failed",
-        RunStatus::Interrupted => "interrupted",
-        RunStatus::Canceled => "canceled",
+        status => run_status_label(status, run.phase),
+    };
+    // A run that used an out-of-date image is marked; the run detail says why.
+    let status = if run.image_warning.is_some() {
+        format!("{status} \u{26a0}")
+    } else {
+        status.to_string()
     };
     let finished = run
         .finished_at
@@ -610,7 +819,7 @@ fn squad_history_cells(run: &crate::data::fs::task_store::Run, show_unmet: bool)
         .unwrap_or_else(|| "\u{2014}".to_string());
     let mut cells = vec![
         run.started_at.format("%Y-%m-%d %H:%M").to_string(),
-        status.to_string(),
+        status,
         run.reason
             .as_deref()
             .map(|reason| squad_history_clip(reason, SQUAD_HISTORY_TEXT_MAX_W))
@@ -652,7 +861,11 @@ fn squad_history_column_wants(runs: &[crate::data::fs::task_store::Run]) -> Vec<
         }
     }
     wants[0] = SQUAD_HISTORY_TIME_W;
-    wants[1] = SQUAD_HISTORY_STATUS_W;
+    // One cell wider when some run carries the stale-image marker, so the
+    // longest status keeps it ("not triggered ⚠"). Measured over every run,
+    // so scrolling never reshapes the table.
+    let marked = runs.iter().any(|run| run.image_warning.is_some());
+    wants[1] = SQUAD_HISTORY_STATUS_W + u16::from(marked);
     wants[3] = SQUAD_HISTORY_TIME_W;
     wants
 }

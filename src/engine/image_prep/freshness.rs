@@ -92,24 +92,28 @@ impl AgentImagePreparer {
                         Ok(runtime.inspect_image(tag)?.map(|image| image.id))
                     })?;
                 let mut recipe = None;
-                if reference != parent_ref {
-                    let parent_image = runtime.inspect_image(&parent)?;
-                    if let Some(parent_image) = parent_image {
-                        let bytes = std::fs::read(&request.dockerfile)
-                            .map_err(|e| EngineError::io(&request.dockerfile, e))?;
-                        let text = crate::data::image_inputs::bind_project_base(
-                            &bytes,
-                            &parent,
-                            &parent_image.id,
-                        )
-                        .map_err(EngineError::Config)?;
-                        let pinned = tempfile::NamedTempFile::new()
-                            .map_err(|e| EngineError::io(&request.dockerfile, e))?;
-                        std::fs::write(pinned.path(), text)
-                            .map_err(|e| EngineError::io(pinned.path(), e))?;
-                        request.dockerfile = pinned.path().into();
-                        recipe = Some(pinned);
-                    }
+                let base = if reference == parent_ref {
+                    None
+                } else {
+                    runtime.inspect_image(&parent)?
+                };
+                if let Some(base) = base {
+                    let bytes = std::fs::read(&request.dockerfile)
+                        .map_err(|e| EngineError::io(&request.dockerfile, e))?;
+                    let immutable = if runtime.runtime_name() == "apple-containers" {
+                        &parent
+                    } else {
+                        &base.id
+                    };
+                    let text =
+                        crate::data::image_inputs::bind_project_base(&bytes, &parent, immutable)
+                            .map_err(EngineError::Config)?;
+                    let pinned = tempfile::NamedTempFile::new()
+                        .map_err(|e| EngineError::io(&request.dockerfile, e))?;
+                    std::fs::write(pinned.path(), text)
+                        .map_err(|e| EngineError::io(pinned.path(), e))?;
+                    request.dockerfile = pinned.path().into();
+                    recipe = Some(pinned);
                 }
                 let result = runtime.build_image(&request, &mut |line| {
                     let _ = tx.blocking_send(line.to_string());
@@ -177,7 +181,9 @@ impl AgentImagePreparer {
         if !build.force && matches!(fresh, ImageFreshness::Fresh(_)) {
             return Ok(ImageBuildOutcome::Reused);
         }
-        let request = build.request.with_inputs(&build.inputs, &build.repo);
+        let mut request = build.request.with_inputs(&build.inputs, &build.repo);
+        // The builder process dies with the preparation (run cancel, drop).
+        request.cancel = self.cancel.clone();
         sink.build_started(&tag);
         let result = super::bridge::stream(
             self.cancel.clone(),
@@ -495,7 +501,16 @@ pub(crate) fn label_build(
                 "project image {project_tag} is unavailable for agent input hashing"
             ))
         })?;
-        crate::data::image_inputs::agent_inputs_hash(&bytes, &project_id)
+        crate::data::image_inputs::agent_inputs_hash_at(
+            &bytes,
+            &project_id,
+            &crate::data::image_inputs::DirBuildContext::new(&request.context),
+            &request
+                .dockerfile
+                .strip_prefix(&request.context)
+                .unwrap_or(&request.dockerfile)
+                .to_string_lossy(),
+        )
     } else {
         crate::data::image_inputs::project_inputs_at(
             bytes.as_deref(),

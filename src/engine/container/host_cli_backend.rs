@@ -122,7 +122,7 @@ pub(super) fn cli_build_image(
     let status = ProcessHostCommandRunner
         .run(
             command,
-            &BuildControl::unbounded(CancelToken::new()),
+            &BuildControl::unbounded(request.cancel.clone()),
             &mut |line| {
                 output.push_bytes(line.as_bytes());
                 output.push_bytes(b"\n");

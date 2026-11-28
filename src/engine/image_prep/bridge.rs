@@ -2,6 +2,7 @@
 //! dropped while the builder is running.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::data::oci_identity::OciPlatform;
 use crate::engine::error::EngineError;
@@ -31,6 +32,30 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         if let Some(token) = &self.0 {
             token.cancel();
+        }
+    }
+}
+
+/// A dropped preparation must finish stopping its owned builder before the
+/// caller can record the run as canceled. Close the output queue first so a
+/// worker blocked on progress delivery can observe cancellation too.
+struct StreamCancelOnDrop<E> {
+    cancel: Option<CancelToken>,
+    events: tokio::sync::mpsc::Receiver<E>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+impl<E> Drop for StreamCancelOnDrop<E> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            self.events.close();
+            cancel.cancel();
+            if matches!(
+                self.finished.recv_timeout(Duration::from_secs(5)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                tracing::warn!("image preparation worker did not stop after cancellation");
+            }
         }
     }
 }
@@ -126,16 +151,25 @@ pub(crate) async fn stream<T: Send + 'static, E: Send + 'static>(
     mut report: impl FnMut(E),
 ) -> Result<T, EngineError> {
     cancel.check()?;
-    let guard = CancelOnDrop::arm(cancel);
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let worker = tokio::task::spawn_blocking(move || work(tx));
-    while let Some(event) = rx.recv().await {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = work(tx);
+        let _ = finished_tx.send(());
+        result
+    });
+    let mut guard = StreamCancelOnDrop {
+        cancel: Some(cancel),
+        events: rx,
+        finished: finished_rx,
+    };
+    while let Some(event) = guard.events.recv().await {
         report(event);
     }
     let result = worker
         .await
         .map_err(|_| EngineError::Other("image preparation worker failed".into()))?;
-    guard.disarm();
+    guard.cancel = None;
     result
 }
 impl AgentImagePreparer {

@@ -120,6 +120,9 @@ pub struct RemoteTabView {
     marks: Option<Marks>,
     /// Set once the engine is gone: the exit code `tui::run` returns.
     fatal_exit_code: Option<u8>,
+    /// The fatal dialog body held back while a Squad tab presents the loss
+    /// itself (frozen viewer or grid). Shown once another tab is active.
+    deferred_fatal: Option<String>,
 }
 
 impl RemoteTabView {
@@ -133,6 +136,11 @@ impl RemoteTabView {
         if app.remote_view.fatal_exit_code.is_none() {
             if let Err(loss) = app.backend.health() {
                 Self::show_fatal(app, &loss);
+            }
+        }
+        if !app.active_tab().is_squad {
+            if let Some(body) = app.remote_view.deferred_fatal.take() {
+                Self::open_fatal_dialog(app, body);
             }
         }
         for event in app.backend.poll() {
@@ -237,14 +245,27 @@ impl RemoteTabView {
     /// Engine loss and an unasked `Detach` are today's fatal path: the
     /// `FatalError` dialog (Enter, Esc and Ctrl-C quit) over whatever was on
     /// screen, and the fatal exit code. Shown once.
+    ///
+    /// On a Squad tab the loss is presented once by the tab itself (so the
+    /// frozen viewer stays detachable) and the dialog is deferred until another
+    /// tab is active; the exit code is recorded either way.
     fn show_fatal(app: &mut App, loss: &BackendLoss) {
         if app.remote_view.fatal_exit_code.is_some() {
             return;
         }
         app.remote_view.fatal_exit_code = Some(ENGINE_LOST_EXIT_CODE);
+        let body = engine_lost_body(loss);
+        if crate::frontend::tui::squad_attach::show_daemon_loss(app, loss) {
+            app.remote_view.deferred_fatal = Some(body);
+            return;
+        }
+        Self::open_fatal_dialog(app, body);
+    }
+
+    fn open_fatal_dialog(app: &mut App, body: String) {
         app.active_dialog = Some(Dialog::FatalError {
             title: ENGINE_LOST_TITLE.to_string(),
-            body: engine_lost_body(loss),
+            body,
         });
         app.command_dialog_active = false;
         app.command_dialog_deadline = None;

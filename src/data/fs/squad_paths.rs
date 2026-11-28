@@ -15,6 +15,12 @@ use crate::data::error::DataError;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::path_guard::validate_under_root;
 
+mod image_context;
+pub use image_context::{
+    LegacyCopy, LegacyKind, LegacyRecipePlan, LegacyRefusal, TaskImageContext, TaskImageState,
+    MAX_LEGACY_INPUT_BYTES, MAX_LEGACY_INPUT_FILES, PROJECT_RECIPE, TASK_IMAGE_STATE_FILE,
+};
+
 /// Subdirectory under the data home that hosts squad state.
 pub const SQUAD_SUBDIR: &str = "squad";
 

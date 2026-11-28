@@ -5,6 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::command::commands::attach::{initial_client_frames, AttachCommandFrontend};
 use crate::command::error::CommandError;
+use crate::command::terminals::{ReplayEffect, ReplayFeed, ReplayFilter, LAGGED_MESSAGE};
 use crate::data::ids::TerminalId;
 use crate::data::terminal::{DetachReason, HostOutputPolicy, TerminalClientFrame, TerminalFrame};
 use crate::engine::remote::terminal_client::TerminalStream;
@@ -12,17 +13,37 @@ use crate::frontend::cli::command_frontend::RawModeGuard;
 use crate::frontend::cli::CliFrontend;
 use crate::frontend::terminal_output_filter::HostOutputFilter;
 
-fn output_filter(tty: bool, policy: HostOutputPolicy) -> Option<HostOutputFilter> {
-    tty.then(|| HostOutputFilter::new(policy))
-}
-fn safe_output(filter: &mut Option<HostOutputFilter>, bytes: &[u8]) -> Vec<u8> {
-    let mut safe = Vec::new();
-    if let Some(filter) = filter {
-        filter.feed(bytes, &mut safe);
-    } else {
-        safe.extend_from_slice(bytes);
+/// The host filter when stdout is a TTY; bytes pass unchanged to a pipe.
+/// One instance serves the producer stream (history and live output); a
+/// second, same policy, filters snapshot repaints so they never disturb the
+/// stream's mid-sequence state (WI 0105).
+struct CliFilter(Option<(HostOutputFilter, HostOutputFilter)>);
+
+impl ReplayFilter for CliFilter {
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        match &mut self.0 {
+            Some((filter, _)) => filter.feed(chunk, out),
+            None => out.extend_from_slice(chunk),
+        }
     }
-    safe
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        if let Some((filter, _)) = &mut self.0 {
+            filter.finish(out);
+        }
+    }
+    fn feed_snapshot(&mut self, screen: &[u8], out: &mut Vec<u8>) {
+        match &mut self.0 {
+            Some((_, filter)) => {
+                filter.feed(screen, out);
+                filter.finish(out);
+            }
+            None => out.extend_from_slice(screen),
+        }
+    }
+}
+
+fn output_filter(tty: bool, policy: HostOutputPolicy) -> CliFilter {
+    CliFilter(tty.then(|| (HostOutputFilter::new(policy), HostOutputFilter::new(policy))))
 }
 
 // Ctrl-C remains a viewer control even for a read-only session. Preserve the
@@ -144,7 +165,12 @@ impl AttachCommandFrontend for CliFrontend {
             tokio::pin!(hup);
             let mut resize_tick = tokio::time::interval(std::time::Duration::from_millis(100));
             let mut writable = !read_only;
+            let mut feed = ReplayFeed::new();
             let mut last_size = crossterm::terminal::size().ok();
+            // Only a TTY has a screen to fit; a pipe gets the snapshot as is.
+            if let (true, Some((cols, rows))) = (tty, last_size) {
+                feed.set_viewer_size(cols, rows);
+            }
             for frame in initial_client_frames(read_only, last_size) {
                 if stream.send(frame).await.is_err() {
                     hangup.cancel();
@@ -162,6 +188,7 @@ impl AttachCommandFrontend for CliFrontend {
                         let size = crossterm::terminal::size().ok();
                         if size != last_size {
                             if let Some((cols, rows)) = size {
+                                if tty { feed.set_viewer_size(cols, rows); }
                                 if stream.send(TerminalClientFrame::Resize { cols, rows }).await.is_err() { reason = DetachReason::Hangup; break; }
                             }
                             last_size = size;
@@ -173,8 +200,17 @@ impl AttachCommandFrontend for CliFrontend {
                         if detach { break; }
                     }
                     frame = stream.next() => match frame {
-                        Ok(Some(TerminalFrame::Snapshot { screen, .. } | TerminalFrame::Output { bytes: screen })) => {
-                            let safe = safe_output(&mut filter, &screen);
+                        Ok(Some(frame @ (TerminalFrame::History { .. } | TerminalFrame::Snapshot { .. } | TerminalFrame::Output { .. } | TerminalFrame::Lagged))) => {
+                            // History is written raw (after the filter) so the
+                            // host emulator applies the program's own modes and
+                            // keeps it in its own scrollback.
+                            let mut safe = Vec::new();
+                            match feed.apply(&frame, &mut filter, &mut safe) {
+                                ReplayEffect::FirstLag => eprint!("awman: {LAGGED_MESSAGE}\r\n"),
+                                ReplayEffect::Truncated => eprint!("awman: {}\r\n", crate::command::terminals::TRUNCATED_MESSAGE),
+                                ReplayEffect::None => {}
+                            }
+                            if safe.is_empty() { continue; }
                             let mut out = std::io::stdout().lock();
                             if out.write_all(&safe).and_then(|_| out.flush()).is_err() { reason = DetachReason::Hangup; break; }
                         }
@@ -186,7 +222,7 @@ impl AttachCommandFrontend for CliFrontend {
                             }
                         }
                         Ok(Some(TerminalFrame::AutomationState { snapshot })) => { if snapshot.status_support == crate::data::automation::StatusSupport::BestEffort { eprintln!("awman: Best-effort automation status"); } }
-                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
+                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
                         Ok(None) | Err(_) => { reason = DetachReason::Hangup; break; }
                     }
                 }
@@ -197,9 +233,9 @@ impl AttachCommandFrontend for CliFrontend {
             let _ = input.join();
             #[cfg(not(unix))]
             drop(input);
-            if let Some(filter) = filter.as_mut() {
-                let mut safe = Vec::new();
-                filter.finish(&mut safe);
+            let mut safe = Vec::new();
+            filter.finish(&mut safe);
+            if !safe.is_empty() {
                 let _ = std::io::stdout().lock().write_all(&safe);
             }
             let _ = stream.send(TerminalClientFrame::Detached { reason }).await;

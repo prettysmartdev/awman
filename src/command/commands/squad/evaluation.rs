@@ -38,7 +38,7 @@ use crate::command::error::CommandError;
 use crate::command::interaction::{resolve_interaction, InteractionDecision, InteractionSlot};
 use crate::data::config::daemon::DaemonSettings;
 use crate::data::config::env::EnvSnapshot;
-use crate::data::dynamic_workflow_assets::build_squad_leader_prompt;
+use crate::data::dynamic_workflow_assets::{build_squad_leader_prompt, ImageRecipePrompt};
 use crate::data::fs::task_store::{MountScope, Task};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
@@ -51,6 +51,12 @@ use crate::engine::overlay::{ContextOverlay, ContextScope};
 use crate::engine::squad::{
     read_verdict, EvaluationOutcome, EvaluationRequest, LeaderRunSpec, SquadAgentLauncher,
     TaskEvaluator, RUN_DIR_CONTAINER_PATH, VERDICT_FILE_NAME,
+};
+
+pub mod image_inputs;
+use image_inputs::prepare_task_images;
+pub use image_inputs::{
+    image_source_for, ImageSource, PreparedImage, PreparedImages, PreparedOutcome,
 };
 
 /// Where the task directory is mounted inside the leader's container.
@@ -411,90 +417,74 @@ impl LocalTaskEvaluator {
         Ok(session)
     }
 
-    /// Give a plain-directory task root the image definitions an ordinary
-    /// repository root already has, and build the project base image the agent
-    /// images layer on top of.
+    /// Prepare a directory task's images for this run from its task-owned
+    /// context, before its leader, and pin them on `session` (WI 0105).
     ///
-    /// The file writes are create-if-missing (see
-    /// [`SquadAgentLauncher::ensure_directory_workspace_project`]), so nothing already in the
-    /// durable workspace is touched. The base-image build is the same
-    /// `image_exists` → `build_image` pattern
-    /// [`ensure_agent_image`] uses one layer up; agent images themselves are
-    /// still built by `ensure_agent_image`, not here.
-    async fn prepare_directory_workspace_images(
+    /// Brackets the work in [`ImagePreparationEvent`]s: `BuildStarted` per
+    /// actual build, `Stale` per kept image, and one `PreparationFinished`
+    /// whatever the result. Returns `None` on a runtime that runs no images.
+    ///
+    /// Public so the image-preparation journey is testable through the
+    /// evaluator without launching a leader.
+    pub async fn prepare_run_images(
         &self,
-        session: &Session,
-        root: &Path,
-        agents: &[String],
+        request: &EvaluationRequest,
+        session: &mut Session,
+        context: &crate::data::fs::squad_paths::TaskImageContext,
         sink: &mut dyn UserMessageSink,
         build_logs: &mut SquadBuildLogs,
-    ) -> Result<(), CommandError> {
-        for name in agents {
-            let agent = AgentName::new(name.clone()).map_err(CommandError::Data)?;
-            self.engines
-                .agent_engine
-                .resolve_definition(session, &agent)?;
-        }
-        let warnings =
-            crate::engine::squad::SquadAgentLauncher::ensure_directory_workspace_project_with_env(
-                session.env(),
-                root,
-                agents,
-            )
-            .await
-            .map_err(CommandError::from)?;
-        for warning in warnings {
-            sink.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: warning,
-            });
-        }
-
-        let runtime = self
-            .engines
-            .require_container_runtime()
-            .map_err(CommandError::from)?;
-        // An importing runtime (builtin) runs agent images built elsewhere;
-        // the project image is only a build input for those, so there is
-        // nothing to build here (see `ReadyEngine`'s import phases).
-        if runtime.capabilities().image_acquisition
-            == crate::engine::agent_runtime::ImageAcquisition::Import
+    ) -> Result<Option<PreparedImages>, CommandError> {
+        let task = &request.task;
+        // The folder the run mounts at `/awman/context/workflow` must be the
+        // folder its images are built from.
+        if std::fs::canonicalize(&request.task_dir).ok()
+            != std::fs::canonicalize(context.root()).ok()
         {
-            return Ok(());
+            return Err(CommandError::Other(format!(
+                "task {:?}: its workspace {} is not its image context {}",
+                task.name,
+                request.task_dir.display(),
+                context.root().display()
+            )));
         }
-        let project_tag = crate::data::image_tags::project_image_tag(root);
-        if runtime.image_exists(&project_tag) {
-            return Ok(());
-        }
-        let dockerfile = crate::data::RepoDockerfilePaths::new(root).project_dockerfile();
-        sink.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("Building base image for the task workspace ({project_tag})…"),
-        });
-        build_logs.begin(&project_tag);
-        let result = runtime
-            .build_image(
-                &crate::engine::container::BuildRequest::runtime(
-                    &project_tag,
-                    &dockerfile,
-                    root,
-                    false,
-                ),
-                &mut |line: &str| {
-                    build_logs.line(line);
-                },
-            )
-            .map_err(|error| {
-                CommandError::Other(format!(
-                    "failed to build the task workspace's base image from {}: {error}",
-                    dockerfile.display()
-                ))
-            });
-        build_logs.finish(
-            &project_tag,
-            result.as_ref().err().map(|e| e.to_string()).as_deref(),
+        let agents = directory_workspace_agents(
+            task,
+            request.default_leader.as_deref(),
+            request.agents_to_models.as_ref(),
+            session.default_agent().map(|a| a.as_str()),
         );
-        result
+        let _preparation = PreparationGuard::new(&request.progress, &request.run_id);
+        let prepared = prepare_task_images(
+            &self.engines,
+            session,
+            task,
+            context,
+            &agents,
+            sink,
+            Some(build_logs),
+        )
+        .await
+        .map_err(|error| match build_logs.last_failure() {
+            Some(path) => CommandError::Other(format!("{error} (build log: {})", path.display())),
+            None => error,
+        })?;
+        if let Some(prepared) = &prepared {
+            report_stale(&request.progress, &request.run_id, &prepared.warnings);
+            for (name, image) in std::iter::once(("project", &prepared.project))
+                .chain(prepared.agents.iter().map(|(a, i)| (a.as_str(), i)))
+            {
+                tracing::info!(
+                    task = %task.name,
+                    run_id = %request.run_id,
+                    image = %image.tag,
+                    role = name,
+                    outcome = ?image.outcome,
+                    "squad task image prepared"
+                );
+            }
+            session.set_lease_images(prepared.binding());
+        }
+        Ok(prepared)
     }
 
     async fn evaluate_inner(
@@ -507,7 +497,7 @@ impl LocalTaskEvaluator {
         require_container_tier(&self.engines)?;
 
         let task = &request.task;
-        let session = self.open_session(task)?;
+        let mut session = self.open_session(task)?;
         // One decision per run: every agent this run spawns (leader, repairs,
         // workflow steps) runs the same way, sized as configured now.
         let interaction = self.interaction();
@@ -525,33 +515,29 @@ impl LocalTaskEvaluator {
         // Raw container image build output goes to per-build files under
         // `<squad root>/builds/<task>/`, never into the daemon log; the daemon
         // log gets one lifecycle line per build naming the file instead.
-        let mut build_logs = SquadBuildLogs::new(&self.env, &task.name, &request.run_id)?;
+        let mut build_logs = SquadBuildLogs::new(&self.env, &task.name, &request.run_id)?
+            .with_progress(Arc::clone(&request.progress));
 
-        // A directory-workspace task's root is a plain directory, not a
-        // repository, so it carries none of the image definitions
-        // `ensure_agent_image` builds from. Fill the missing ones in from the
-        // bundled templates (create-if-missing — never overwriting anything
-        // already there) *before* Dockerfile discovery, so the agent listing
-        // the leader sees and the workflow validation that follows both see the
-        // same set. Without this a default-workspace task — the default
-        // creation path — fails on every run before its leader launches.
-        if !task.mount_scope.is_git_repo() {
-            self.prepare_directory_workspace_images(
-                &session,
-                &git_root,
-                &directory_workspace_agents(
-                    task,
-                    request.default_leader.as_deref(),
-                    request.agents_to_models.as_ref(),
-                    session.default_agent().map(|a| a.as_str()),
-                ),
-                &mut sink,
-                &mut build_logs,
-            )
-            .await?;
-        }
+        // WI 0105: a directory task's images come from its task-owned image
+        // context, never from the folder mounted as `/workspace` (a custom
+        // non-Git task's) and never from a parent of either. Git-backed tasks
+        // keep their repository. `git_root` keeps its other meanings
+        // (session, worktree, workflow state).
+        let image_source = image_source_for(
+            task,
+            &crate::data::fs::SquadPaths::from_env(&self.env).map_err(CommandError::Data)?,
+            &session,
+        )?;
+        let image_root = image_source.root().to_path_buf();
+        let prepared = match image_source.task_context() {
+            Some(context) => {
+                self.prepare_run_images(request, &mut session, context, &mut sink, &mut build_logs)
+                    .await?
+            }
+            None => None,
+        };
 
-        let dockerfiles = crate::data::RepoDockerfilePaths::new(&git_root);
+        let dockerfiles = crate::data::RepoDockerfilePaths::new(&image_root);
         let (available_agents, warnings) = self
             .engines
             .agent_engine
@@ -629,28 +615,41 @@ impl LocalTaskEvaluator {
                 }
             }
         }
-        // WI 0163: rebuild the task workspace's stale (or unlabeled) named
-        // images once for the whole pool; a failed rebuild keeps the previous
-        // image and is logged as an `image_stale` warning.
-        refresh_stale_workflow_images(
-            &self.engines,
-            &session,
-            &pool_agents,
-            &mut sink,
-            Some(&mut build_logs),
-        )
-        .await?;
-        for pool_agent in &pool_agents {
-            ensure_agent_image_with_build_output(
-                &self.engines,
-                &git_root,
-                &dockerfiles,
-                pool_agent,
-                &session,
-                &mut sink,
-                Some(&mut build_logs),
-            )
-            .await?;
+        match &prepared {
+            // WI 0105: a directory task's whole set was prepared above, before
+            // the leader; nothing is refreshed or built again in this run.
+            Some(prepared) => {
+                for pool_agent in &pool_agents {
+                    prepared.require(pool_agent)?;
+                }
+            }
+            None => {
+                let _preparation = PreparationGuard::new(&request.progress, &request.run_id);
+                // WI 0163: rebuild the task workspace's stale (or unlabeled)
+                // named images once for the whole pool; a failed rebuild keeps
+                // the previous image and is logged as an `image_stale` warning.
+                let refresh = refresh_stale_workflow_images(
+                    &self.engines,
+                    &session,
+                    &pool_agents,
+                    &mut sink,
+                    Some(&mut build_logs),
+                )
+                .await?;
+                report_stale(&request.progress, &request.run_id, &refresh.warnings);
+                for pool_agent in &pool_agents {
+                    ensure_agent_image_with_build_output(
+                        &self.engines,
+                        &image_root,
+                        &dockerfiles,
+                        pool_agent,
+                        &session,
+                        &mut sink,
+                        Some(&mut build_logs),
+                    )
+                    .await?;
+                }
+            }
         }
 
         // The overlay set is collected once, here, and reused for the prompt
@@ -659,6 +658,14 @@ impl LocalTaskEvaluator {
         // resolution that could drift from it (WI 0117).
         let collected = collect_task_overlays(&session, task)?;
 
+        // WI 0105: a directory task is told where its task-owned recipes are
+        // and that edits apply from the next run's preparation.
+        let image_recipes = prepared.as_ref().map(|prepared| {
+            let agents: Vec<String> = prepared.agents.keys().cloned().collect();
+            let same_directory = std::fs::canonicalize(&task.repo_scope).ok()
+                == std::fs::canonicalize(&prepared.image_root).ok();
+            ImageRecipePrompt::at(TASK_DIR_CONTAINER_PATH, &agents, same_directory)
+        });
         // `guidance` is additive and never overridden by a task, so it is
         // rendered into every leader prompt regardless of which level supplied
         // the agent and model.
@@ -670,6 +677,7 @@ impl LocalTaskEvaluator {
             &overlay_inventory(&collected),
             &format!("{RUN_DIR_CONTAINER_PATH}/{VERDICT_FILE_NAME}"),
             request.guidance.as_deref(),
+            image_recipes.as_ref(),
         );
         // Gaps in the task's workflow prerequisites reach the leader the same way
         // missing `env()` names do, so it does not design a step that will fail.
@@ -716,7 +724,7 @@ impl LocalTaskEvaluator {
             let mut run_options = self.leader_run_options(
                 repair.prompt(),
                 leader.model.as_deref(),
-                &git_root,
+                &image_root,
                 agent.as_str(),
                 &request.task_dir,
                 &request.run_log_dir,
@@ -891,17 +899,49 @@ impl LocalTaskEvaluator {
                 &dockerfiles,
             )
             .map_err(CommandError::Other)?;
-        for step_agent in &workflow_agents {
-            ensure_agent_image_with_build_output(
-                &self.engines,
-                &git_root,
-                &dockerfiles,
-                step_agent,
-                &session,
-                &mut sink,
-                Some(&mut build_logs),
-            )
-            .await?;
+        match &prepared {
+            // WI 0105: one generation per run. A step agent the leader picked
+            // that was not prepared fails here; it is never built mid-run.
+            Some(prepared) => {
+                for step_agent in &workflow_agents {
+                    prepared.require(step_agent)?;
+                }
+            }
+            None => {
+                let _preparation = PreparationGuard::new(&request.progress, &request.run_id);
+                // A step agent outside the leader's pool was not covered by the
+                // refresh above. Refresh its stale image here, where the build
+                // is reported against this run (WI 0105), instead of leaving it
+                // to the workflow's own preflight, which reports nothing to it.
+                let outside_pool: Vec<String> = workflow_agents
+                    .iter()
+                    .filter(|step_agent| !pool_agents.contains(step_agent))
+                    .cloned()
+                    .collect();
+                if !outside_pool.is_empty() {
+                    let refresh = refresh_stale_workflow_images(
+                        &self.engines,
+                        &session,
+                        &outside_pool,
+                        &mut sink,
+                        Some(&mut build_logs),
+                    )
+                    .await?;
+                    report_stale(&request.progress, &request.run_id, &refresh.warnings);
+                }
+                for step_agent in &workflow_agents {
+                    ensure_agent_image_with_build_output(
+                        &self.engines,
+                        &image_root,
+                        &dockerfiles,
+                        step_agent,
+                        &session,
+                        &mut sink,
+                        Some(&mut build_logs),
+                    )
+                    .await?;
+                }
+            }
         }
 
         // Record the engine's own state file on the run row *before* the
@@ -953,6 +993,7 @@ impl LocalTaskEvaluator {
         generated_path: &Path,
         interaction: InteractionDecision,
     ) -> Result<crate::command::commands::exec_workflow::ExecWorkflowOutcome, CommandError> {
+        let session_has_prepared_images = session.lease_images().is_some();
         let task = &request.task;
         let uses_worktree = task.uses_worktree();
         // Stamp every generated-workflow step container with the same squad
@@ -1001,6 +1042,12 @@ impl LocalTaskEvaluator {
             // instead. Must agree with `workflow_state_path` above, which is
             // what the run row records for the daemon's workflow route.
             command = command.with_workflow_state_root(request.run_log_dir.clone());
+        }
+        if task.mount_scope == MountScope::Directory && session_has_prepared_images {
+            // WI 0105: setup/teardown containers use the project image
+            // prepared from the task context, like the leader and the steps.
+            // `prepare_run_images` checked that the context is `task_dir`.
+            command = command.with_image_root(request.task_dir.clone());
         }
         let mut workflow_frontend = self.frontends.workflow_frontend(
             &task.name,
@@ -1270,16 +1317,21 @@ fn mount_scope_decision(scope: MountScope) -> MountScopeDecision {
 /// Files live at `<squad root>/builds/<task>/<run-id>-<n>.log` — one file per
 /// build that actually happens (`begin` is only called when an image is
 /// missing, so an image-exists fast path never leaves an empty file behind).
-pub(crate) struct SquadBuildLogs {
+pub struct SquadBuildLogs {
     task: String,
     paths: crate::data::fs::SquadPaths,
     run_id: String,
     seq: u32,
     current: Option<(std::path::PathBuf, std::fs::File)>,
+    /// The log of the last build that failed, for the run's error.
+    last_failure: Option<std::path::PathBuf>,
+    /// Where an actual build start is reported (WI 0105).
+    progress: Option<Arc<dyn crate::engine::squad::evaluator::RunProgress>>,
+    run: crate::data::fs::RunId,
 }
 
 impl SquadBuildLogs {
-    pub(crate) fn new(
+    pub fn new(
         env: &EnvSnapshot,
         task: &str,
         run_id: &crate::data::fs::RunId,
@@ -1291,13 +1343,40 @@ impl SquadBuildLogs {
             run_id: run_id.as_str().to_string(),
             seq: 0,
             current: None,
+            last_failure: None,
+            progress: None,
+            run: run_id.clone(),
         })
+    }
+
+    /// Report every build that actually starts as
+    /// [`ImagePreparationEvent::BuildStarted`]. `begin` is only called once a
+    /// build is decided and its lease held, never for a reused image.
+    pub fn with_progress(
+        mut self,
+        progress: Arc<dyn crate::engine::squad::evaluator::RunProgress>,
+    ) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The log file of the last build that failed in this run.
+    pub fn last_failure(&self) -> Option<&Path> {
+        self.last_failure.as_deref()
     }
 }
 
 impl BuildOutputTarget for SquadBuildLogs {
     fn begin(&mut self, image: &str) {
         self.seq += 1;
+        if let Some(progress) = &self.progress {
+            progress.image_preparation(
+                &self.run,
+                crate::engine::squad::evaluator::ImagePreparationEvent::BuildStarted {
+                    image: image.to_string(),
+                },
+            );
+        }
         // Layer 0 owns the directory, the filename and the create (F-47).
         match self.paths.build_log(&self.task, &self.run_id, self.seq) {
             Ok((path, file)) => {
@@ -1335,6 +1414,9 @@ impl BuildOutputTarget for SquadBuildLogs {
             let _ = file.flush();
             path
         });
+        if error.is_some() {
+            self.last_failure = path.clone();
+        }
         let log_path = path
             .as_ref()
             .map(|p| p.display().to_string())
@@ -1383,6 +1465,66 @@ impl UserMessageSink for TracingSink {
         }
     }
     fn replay_queued(&mut self) {}
+    /// A failed refresh kept the previous image (the WI 0163 fallback). It
+    /// is logged as stale — never as fresh or rebuilt. The run's progress gets
+    /// the same warnings from the preparation result (`report_stale`).
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        tracing::warn!(
+            task = %self.task,
+            image = %warning.image,
+            expected_inputs = %warning.expected_inputs,
+            installed_inputs = ?warning.installed_inputs,
+            reason = %warning.reason,
+            "image is stale: {} failed; this run keeps the previously installed image",
+            warning.build
+        );
+    }
+}
+
+/// Report each kept stale image to the run's progress (WI 0105), from the
+/// preparation's own result so it never depends on which sink ran it.
+fn report_stale(
+    progress: &Arc<dyn crate::engine::squad::evaluator::RunProgress>,
+    run_id: &crate::data::fs::RunId,
+    warnings: &[crate::data::execution_event::ImageStaleWarning],
+) {
+    for warning in warnings {
+        progress.image_preparation(
+            run_id,
+            crate::engine::squad::evaluator::ImagePreparationEvent::Stale {
+                image: warning.image.clone(),
+                reason: warning.reason.clone(),
+            },
+        );
+    }
+}
+
+/// Sends [`ImagePreparationEvent::PreparationFinished`] exactly once when
+/// dropped, so a failed or cancelled preparation still ends its phase.
+struct PreparationGuard {
+    progress: Arc<dyn crate::engine::squad::evaluator::RunProgress>,
+    run_id: crate::data::fs::RunId,
+}
+
+impl PreparationGuard {
+    fn new(
+        progress: &Arc<dyn crate::engine::squad::evaluator::RunProgress>,
+        run_id: &crate::data::fs::RunId,
+    ) -> Self {
+        Self {
+            progress: Arc::clone(progress),
+            run_id: run_id.clone(),
+        }
+    }
+}
+
+impl Drop for PreparationGuard {
+    fn drop(&mut self) {
+        self.progress.image_preparation(
+            &self.run_id,
+            crate::engine::squad::evaluator::ImagePreparationEvent::PreparationFinished,
+        );
+    }
 }
 
 /// Append the workflow prerequisite summary (WI 0149 §6) to a squad leader

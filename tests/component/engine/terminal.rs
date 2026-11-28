@@ -7,6 +7,9 @@ use awman::data::{
 use awman::engine::terminal_hub::{TerminalHub, TerminalHubConfig, TerminalRegistration};
 use std::sync::Arc;
 
+#[cfg(unix)]
+mod history;
+
 #[tokio::test]
 async fn pending_output_is_flushed_before_terminal_exit() {
     let sandbox =

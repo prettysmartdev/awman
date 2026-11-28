@@ -447,6 +447,7 @@ impl Command for ExecWorkflowCommand {
             frontend,
             self.squad_identity.as_ref(),
             self.task_workspace.as_deref(),
+            self.image_root.as_deref(),
             self.workflow_state_root.as_deref(),
             self.managed_session.as_ref(),
             &self.cancel,

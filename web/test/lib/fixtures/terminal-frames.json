@@ -658,6 +658,36 @@
       }
     ]
   },
+  "history_examples": {
+    "comment": "Sent only to viewers that request ?history=true (awman attach, the TUI slot); never to web or worker clients.",
+    "server": [
+      {
+        "type": "history",
+        "bytes": "bGluZSAxDQpsaW5lIDINCg==",
+        "truncated": true
+      },
+      {
+        "type": "history",
+        "bytes": "bGluZSAzDQo=",
+        "truncated": false
+      }
+    ],
+    "without_truncated": {
+      "type": "history",
+      "bytes": ""
+    },
+    "invalid": [
+      {
+        "type": "history",
+        "bytes": "not base64!",
+        "truncated": false
+      },
+      {
+        "type": "history",
+        "truncated": false
+      }
+    ]
+  },
   "wsp": {
     "server": [
       "error",
