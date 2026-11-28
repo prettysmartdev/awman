@@ -237,6 +237,24 @@ fn reason(report: &SbxSmokeReport) -> (Outcome, &str) {
     (report.outcome, report.reason_code.as_deref().unwrap_or(""))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_failure_details(job: &SbxSmokeJob, report: &SbxSmokeReport) -> String {
+    let lifecycle = job.out_dir.join("lifecycle");
+    let read = |name: &str| {
+        fs::read_to_string(lifecycle.join(name))
+            .unwrap_or_else(|error| format!("<unavailable: {error}>"))
+    };
+    format!(
+        "reason={:?}; ssh-exit={}; ssh-log={}; receipt-bytes={:?}; reconcile={}",
+        report.reason,
+        read("ssh-exit.txt"),
+        read("ssh.log"),
+        fs::metadata(lifecycle.join("receipt.json")).map(|metadata| metadata.len()),
+        fs::read_to_string(job.out_dir.join("reconcile.json"))
+            .unwrap_or_else(|error| format!("<unavailable: {error}>")),
+    )
+}
+
 /// Rewrite a report after tampering, refreshing its file list so only the
 /// semantic check under test can reject it.
 fn rewrite(job: &SbxSmokeJob, edit: impl FnOnce(&mut SbxSmokeReport)) {
@@ -903,8 +921,8 @@ fn linux_smoke_over_ssh_passes_and_leaves_nothing_on_the_host() {
     assert_eq!(
         reason(&report),
         (Outcome::Passed, ""),
-        "{:?}",
-        report.reason
+        "{}",
+        linux_failure_details(&job, &report)
     );
     assert!(
         fs::read_to_string(job.out_dir.join("remote-logs/exec.stdout"))
@@ -989,8 +1007,8 @@ fn linux_smoke_ignores_ambient_remote_git_routing() {
     assert_eq!(
         reason(&report),
         (Outcome::Passed, ""),
-        "{:?}",
-        report.reason
+        "{}",
+        linux_failure_details(&job, &report)
     );
     assert!(
         !sentinel.join(".git/HEAD.lock").exists(),
@@ -1068,7 +1086,13 @@ fn linux_unreachable_signed_out_and_occupied_hosts_block_without_mutation() {
     f.clear("ssh-unreachable");
     // Reachable again: the earlier intent reconciles (its root never
     // existed) and the retry passes.
-    assert_eq!(run(&job).unwrap().outcome, Outcome::Passed);
+    let report = run(&job).unwrap();
+    assert_eq!(
+        report.outcome,
+        Outcome::Passed,
+        "{}",
+        linux_failure_details(&job, &report)
+    );
     fs::write(f.state.join("calls"), b"").unwrap();
     f.flag("signed-out");
     let job = f.linux("signed-out");
