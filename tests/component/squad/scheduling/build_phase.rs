@@ -40,7 +40,6 @@ const LIMIT: Duration = Duration::from_secs(30);
 const NAME: &str = "builder";
 
 struct Fixture {
-    sandbox: TestSandbox,
     docker: FakeCli,
     env: EnvSnapshot,
     engines: Engines,
@@ -48,6 +47,8 @@ struct Fixture {
     store: Arc<TaskStore>,
     clock: Arc<ManualClock>,
     root: PathBuf,
+    // Drop after the database, evaluator, and fake CLI release their files.
+    sandbox: TestSandbox,
 }
 
 /// One due default-workspace task with a Claude recipe and nothing built.
@@ -103,7 +104,6 @@ fn fixture(id: &'static str) -> Fixture {
     row.agent = Some("claude".into());
     store.create(&row).unwrap();
     Fixture {
-        sandbox,
         docker,
         env,
         engines,
@@ -111,6 +111,7 @@ fn fixture(id: &'static str) -> Fixture {
         store,
         clock,
         root,
+        sandbox,
     }
 }
 
@@ -397,7 +398,6 @@ async fn an_actual_build_is_the_phase_of_the_current_run_and_a_reuse_never_is() 
     evaluator.finish.add_permits(1);
     ended(run).await;
     assert_eq!(f.latest().status, RunStatus::NotTriggered);
-    f.sandbox.finish();
 }
 
 #[tokio::test]
@@ -526,7 +526,6 @@ async fn a_kept_stale_image_is_recorded_on_the_run_that_used_it() {
         seen.last(),
         Some(&(ImagePreparationEvent::PreparationFinished, None))
     );
-    f.sandbox.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -549,7 +548,6 @@ async fn a_failed_build_ends_the_run_failed_naming_its_build_log() {
     assert!(error.contains("failed to build project image"), "{error}");
     assert!(error.contains("build log:"), "{error}");
     assert!(f.store.get(NAME).unwrap().unwrap().backoff_until.is_some());
-    f.sandbox.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -604,7 +602,6 @@ async fn canceling_a_building_run_records_canceled_without_a_phase() {
     assert_eq!(published, 0, "no image is published after the cancel");
     assert_eq!(f.latest().status, RunStatus::Canceled);
     assert_eq!(f.latest().phase, None);
-    f.sandbox.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -645,5 +642,4 @@ async fn restart_recovery_interrupts_a_building_run_for_good() {
     );
     assert_eq!(f.latest().status, RunStatus::Interrupted);
     assert_eq!(f.latest().phase, None);
-    f.sandbox.finish();
 }

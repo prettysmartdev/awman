@@ -92,20 +92,28 @@ impl AgentImagePreparer {
                         Ok(runtime.inspect_image(tag)?.map(|image| image.id))
                     })?;
                 let mut recipe = None;
-                if reference != parent_ref {
-                    if let Some(base) = runtime.inspect_image(&parent)? {
-                        let bytes = std::fs::read(&request.dockerfile)
-                            .map_err(|e| EngineError::io(&request.dockerfile, e))?;
-                        let text =
-                            crate::data::image_inputs::bind_project_base(&bytes, &parent, &base.id)
-                                .map_err(EngineError::Config)?;
-                        let pinned = tempfile::NamedTempFile::new()
-                            .map_err(|e| EngineError::io(&request.dockerfile, e))?;
-                        std::fs::write(pinned.path(), text)
-                            .map_err(|e| EngineError::io(pinned.path(), e))?;
-                        request.dockerfile = pinned.path().into();
-                        recipe = Some(pinned);
-                    }
+                let base = if reference == parent_ref {
+                    None
+                } else {
+                    runtime.inspect_image(&parent)?
+                };
+                if let Some(base) = base {
+                    let bytes = std::fs::read(&request.dockerfile)
+                        .map_err(|e| EngineError::io(&request.dockerfile, e))?;
+                    let immutable = if runtime.runtime_name() == "apple-containers" {
+                        &parent
+                    } else {
+                        &base.id
+                    };
+                    let text =
+                        crate::data::image_inputs::bind_project_base(&bytes, &parent, immutable)
+                            .map_err(EngineError::Config)?;
+                    let pinned = tempfile::NamedTempFile::new()
+                        .map_err(|e| EngineError::io(&request.dockerfile, e))?;
+                    std::fs::write(pinned.path(), text)
+                        .map_err(|e| EngineError::io(pinned.path(), e))?;
+                    request.dockerfile = pinned.path().into();
+                    recipe = Some(pinned);
                 }
                 let result = runtime.build_image(&request, &mut |line| {
                     let _ = tx.blocking_send(line.to_string());

@@ -24,6 +24,7 @@ pub(crate) struct Store {
     pub installed_sources:
         Mutex<HashMap<String, crate::data::config::image_source::ImageSourceSpec>>,
     pub built: Mutex<Vec<String>>,
+    pub source_build_recipes: Mutex<Vec<(BuildTarget, String)>>,
     pub imports: Mutex<Vec<String>>,
     pub import_requests: Mutex<Vec<ImageImportRequest>>,
     pub fail_build: std::sync::atomic::AtomicBool,
@@ -201,6 +202,10 @@ impl LocalImageBuilder for Store {
     ) -> Result<BuiltImageIdentity, EngineError> {
         on_line("builder stdout");
         self.built.lock().unwrap().push(request.reference.clone());
+        self.source_build_recipes.lock().unwrap().push((
+            request.target.clone(),
+            std::fs::read_to_string(&request.dockerfile).unwrap_or_default(),
+        ));
         if self.fail_build.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(EngineError::ImageBuildExitNonzero {
                 tag: request.reference.clone(),
@@ -1139,6 +1144,72 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
     assert_eq!(reused.build, StepStatus::Skipped);
     assert_eq!(store.built.lock().unwrap().len(), 2);
     s.finish();
+}
+
+#[tokio::test]
+async fn builtin_local_builders_use_the_project_tag_for_agent_images() {
+    use crate::data::config::image_source::ImageSourceSpec;
+    use crate::data::image_tags::{agent_image_tag, project_image_tag};
+
+    for source in [
+        ImageSourceSpec::AppleStore { reference: None },
+        ImageSourceSpec::DockerStore {
+            host: Some("unix:///tmp/awman-builder-test.sock".into()),
+            tls: None,
+            reference: None,
+        },
+    ] {
+        let s = TestSandbox::for_test(TestCase::component(
+            "engine::image_prep::contracts::builtin_local_builders_use_the_project_tag_for_agent_images",
+        ));
+        let store = Arc::new(Store::default());
+        let mut prep = preparer(&s, store.clone(), true, Some(source.clone()));
+        let project_tag = project_image_tag(&s.work());
+        let agent_tag = agent_image_tag(&s.work(), "claude");
+        std::fs::write(
+            s.work().join(".awman/Dockerfile.claude"),
+            format!("FROM {project_tag}\nRUN true\n"),
+        )
+        .unwrap();
+
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &agent_tag,
+                    agent: "claude",
+                    policy: BuildPolicy::Ready {
+                        build: true,
+                        no_cache: false,
+                        refresh: false,
+                    },
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        if cfg!(windows) && matches!(source, ImageSourceSpec::DockerStore { .. }) {
+            assert!(matches!(
+                result.build,
+                StepStatus::Failed(ref reason)
+                    if reason.contains("must name an absolute socket path")
+            ));
+            assert!(store.source_build_recipes.lock().unwrap().is_empty());
+            s.finish();
+            continue;
+        }
+        assert_eq!(result.build, StepStatus::Done, "{source:?}");
+        let recipes = store.source_build_recipes.lock().unwrap();
+        assert_eq!(recipes.len(), 2, "{source:?}");
+        assert_eq!(recipes[1].1, format!("FROM {project_tag}\nRUN true\n"));
+        assert!(match (&source, &recipes[1].0) {
+            (ImageSourceSpec::AppleStore { .. }, BuildTarget::Apple) => true,
+            (ImageSourceSpec::DockerStore { .. }, BuildTarget::Docker { endpoint }) => {
+                endpoint == "unix:///tmp/awman-builder-test.sock"
+            }
+            _ => false,
+        });
+        s.finish();
+    }
 }
 
 #[test]
