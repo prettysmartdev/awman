@@ -604,6 +604,15 @@ fn readiness_failures_fail_and_its_sandbox_is_removed_and_verified() {
         !f.state.join("ready-argv").exists(),
         "a mismatched asset never runs"
     );
+    assert!(f.sandboxes().is_empty());
+    f.finish();
+}
+
+#[test]
+fn readiness_created_sandbox_is_removed_and_verified() {
+    let f = fixture(
+        "sbx_validation::release::tests::readiness_created_sandbox_is_removed_and_verified",
+    );
     // awman ready creating its production sandbox is fine: it is removed
     // and verified absent, and the check still passes.
     f.flag("ready-creates");

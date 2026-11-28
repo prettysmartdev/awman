@@ -224,6 +224,10 @@ finish() {
     fi
     if test -n "$cli" && test -f "$cli"; then cli_after=$(digest "$cli"); fi
     if test -n "$blocked" && test "$result" -eq 0; then result=2; fi
+    # Keep the receipt on an open descriptor while removing its directory.
+    # The controller must never receive a completed receipt before the owned
+    # root is gone, even when SSH or setsid forks on the remote host.
+    {
     printf '{"schema":1,"mode":"release","target":"linux/%s","sandbox":"%s","root":"%s",' "$arch" "$name" "$root"
     printf '"cli":%s,"cli_version":"%s","cli_sha256":"%s","cli_sha256_after":"%s",' "$(b64s "$cli")" "$version" "$cli_sha" "$cli_after"
     printf '"exit":%s,"blocked":"%s","guest_round_trip":%s,"sandbox_claimed":%s,"ready_claimed":%s,"steps":{' "$result" "$blocked" "$round_trip" "$created" "$ready_ran"
@@ -242,8 +246,12 @@ finish() {
         separator=,
     done
     printf '}}\n'
+    } > "$root/receipt.json"
+    exec 3< "$root/receipt.json"
     cd /
     rm -rf "$root" || { printf 'release-sbx-linux: owned root could not be removed\n' >&2; result=1; }
+    cat <&3
+    exec 3<&-
     exit "$result"
 }
 asset_now=
