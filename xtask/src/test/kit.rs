@@ -1227,7 +1227,7 @@ mod runtime_tests {
             schema: 1,
             runtime: runtime.into(),
             owner: owner.into(),
-            cli_path: cli,
+            cli_path: cli.canonicalize().unwrap(),
             cli_sha256: digest::sha256(b"private service identity"),
             engine: (runtime == "docker").then(|| "unix:///private-test/docker.sock".into()),
             project: "awsmoke-0123456789abcdef".into(),

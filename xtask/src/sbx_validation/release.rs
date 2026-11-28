@@ -1601,6 +1601,7 @@ fn run_ssh(
         destination,
         &[
             "setsid",
+            "--wait",
             "sh",
             "-s",
             "--",

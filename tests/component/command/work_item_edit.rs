@@ -497,6 +497,19 @@ async fn creation_and_edit_sessions_connect_agent_status_before_waiting() {
                 .iter()
                 .any(|a| a == "--dangerously-skip-permissions"));
         }
+        awman_test_support::wait_for_async_with(
+            "frontend PTY and agent status connection while the agent is running",
+            LIMIT,
+            || {
+                let events = log.events();
+                async move {
+                    (events.contains(&Event::Pty(true)) && events.contains(&Event::StatusConnected))
+                        .then_some(())
+                }
+            },
+            || format!("{kind}, remote={remote}: {:?}", log.events()),
+        )
+        .await;
         let events = log.events();
         assert!(
             events.contains(&Event::Pty(true)),

@@ -86,7 +86,13 @@ if test -f "$D/git-routing"; then
     GIT_WORK_TREE=$(sed -n '2p' "$D/git-routing")
     export GIT_DIR GIT_WORK_TREE
 fi
-exec sh -c "$*"
+remote=$*
+if test -f "$D/force-setsid-fork"; then
+    case "$remote" in
+    setsid\ *) remote="setsid --fork ${remote#setsid }" ;;
+    esac
+fi
+exec sh -c "$remote"
 "#;
 
 /// A fake agent: if anything ran it on the host, the marker would appear.
@@ -881,6 +887,7 @@ fn local_probe_classifies_missing_old_and_signed_out_cli() {
 #[test]
 fn linux_smoke_over_ssh_passes_and_leaves_nothing_on_the_host() {
     let f = fixture("sbx_validation::release::tests::linux_smoke_over_ssh_passes_and_leaves_nothing_on_the_host");
+    f.flag("force-setsid-fork");
     f.write("sandboxes/user-sandbox", "/elsewhere\n");
     let job = f.linux("linux");
     let report = run(&job).unwrap();
@@ -984,7 +991,7 @@ fn linux_smoke_ignores_ambient_remote_git_routing() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn remote_reconciliation_stops_a_term_resistant_worker_before_removing_scratch() {
     use awman_test_support::{Ready, Stdin};
     let f = fixture("sbx_validation::release::tests::remote_reconciliation_stops_a_term_resistant_worker_before_removing_scratch");
