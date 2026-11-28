@@ -27,6 +27,7 @@ pub struct Plan {
     pub evidence_validity_days: Option<u32>,
     pub assets: Vec<AssetPlan>,
     pub native: Vec<NativePlan>,
+    pub sbx_smoke: Vec<SbxSmokePlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +70,22 @@ pub struct NativePlan {
     pub budget_seconds: u64,
     pub required: bool,
     pub kit_artifact: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SbxSmokePlan {
+    pub id: String,
+    pub asset: String,
+    pub triple: String,
+    pub host: String,
+    pub selection: String,
+    pub steps: Vec<String>,
+    pub ready_agent: String,
+    pub min_cli_version: String,
+    pub lifecycle_budget_seconds: u64,
+    pub ready_budget_seconds: u64,
+    pub budget_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,7 +166,12 @@ impl Plan {
                 }
             }
         }
+        super::runtime_smoke::validate_plan(self)?;
+        let mut native_ids = std::collections::BTreeSet::new();
         for n in &self.native {
+            if !native_ids.insert(&n.id) {
+                return bad(format!("duplicate native obligation {}", n.id));
+            }
             if !n.required {
                 return bad(format!(
                     "native check {} is not required; required native checks have no waiver",
@@ -272,7 +294,7 @@ pub mod tests {
     fn the_contract_fixture_parses_with_four_assets_and_two_required_native_checks() {
         let (plan, digest) = Plan::parse(&fixture_bytes()).unwrap();
         assert_eq!(plan.assets.len(), 4);
-        assert_eq!(plan.native.len(), 2);
+        assert_eq!(plan.native.len(), 4);
         assert!(is_sha256(&digest));
         assert!(plan.native.iter().all(|n| n.required));
     }

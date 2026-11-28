@@ -1151,10 +1151,15 @@ async fn builtin_local_builders_use_the_project_tag_for_agent_images() {
     use crate::data::config::image_source::ImageSourceSpec;
     use crate::data::image_tags::{agent_image_tag, project_image_tag};
 
+    let docker_host = if cfg!(windows) {
+        "tcp://127.0.0.1:2375"
+    } else {
+        "unix:///tmp/awman-builder-test.sock"
+    };
     for source in [
         ImageSourceSpec::AppleStore { reference: None },
         ImageSourceSpec::DockerStore {
-            host: Some("unix:///tmp/awman-builder-test.sock".into()),
+            host: Some(docker_host.into()),
             tls: None,
             reference: None,
         },
@@ -1188,11 +1193,7 @@ async fn builtin_local_builders_use_the_project_tag_for_agent_images() {
             .await
             .unwrap();
         if cfg!(windows) && matches!(source, ImageSourceSpec::DockerStore { .. }) {
-            assert!(matches!(
-                result.build,
-                StepStatus::Failed(ref reason)
-                    if reason.contains("must name an absolute socket path")
-            ));
+            assert_eq!(result.build, StepStatus::Skipped);
             assert!(store.source_build_recipes.lock().unwrap().is_empty());
             s.finish();
             continue;
@@ -1204,7 +1205,7 @@ async fn builtin_local_builders_use_the_project_tag_for_agent_images() {
         assert!(match (&source, &recipes[1].0) {
             (ImageSourceSpec::AppleStore { .. }, BuildTarget::Apple) => true,
             (ImageSourceSpec::DockerStore { .. }, BuildTarget::Docker { endpoint }) => {
-                endpoint == "unix:///tmp/awman-builder-test.sock"
+                endpoint == docker_host
             }
             _ => false,
         });

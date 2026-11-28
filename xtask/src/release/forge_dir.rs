@@ -99,6 +99,12 @@ pub struct NativeScript {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Script {
     #[serde(default)]
+    pub sbx_smoke: BTreeMap<String, NativeScript>,
+    #[serde(default)]
+    pub sbx_smoke_unavailable: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sbx_smoke_version: Option<String>,
+    #[serde(default)]
     pub sbx_version: Option<String>,
     #[serde(default)]
     pub sbx_change_before_seal: bool,
@@ -453,14 +459,7 @@ pub fn fake_kit(native: &Value, plan: &Value, commit: &str, tree: &str) -> Vec<u
     let exe = b"#!/bin/sh\nexit 2\n".to_vec();
     let expected =
         serde_json::to_vec(&fake_inventory(native["tests"].as_array().unwrap())).unwrap();
-    let capabilities = if native["id"] == crate::manifest::release_policy::SBX_NATIVE {
-        serde_json::to_vec(
-            &json!({"schema":1,"grants":["docker-sbx","sbx-test-identity","public-network"]}),
-        )
-        .unwrap()
-    } else {
-        b"{\"schema\":1,\"grants\":[\"hypervisor\",\"offline\"]}".to_vec()
-    };
+    let capabilities = serde_json::to_vec(&json!({"schema":1,"grants":crate::manifest::release_policy::native_grants(native["id"].as_str().unwrap()).unwrap()})).unwrap();
     let mut files = BTreeMap::from([
         ("bin/xtask", exe),
         ("expected.json", expected),
@@ -1337,6 +1336,7 @@ impl Clock for VirtualClock {
         self.dir.load().clock
     }
     fn sleep(&self, seconds: u64) {
+        std::thread::yield_now();
         self.dir
             .with(|s| s.clock += chrono::Duration::seconds(seconds as i64));
     }
@@ -1365,7 +1365,58 @@ pub struct FakeHosts {
     pub token: String,
 }
 
+#[allow(private_interfaces)]
 impl Hosts for FakeHosts {
+    fn sbx_smoke_reconcile(&self, job: &super::runtime_smoke::sbx::SbxSmokeJob) -> Step {
+        self.dir
+            .call(format!("sbx-smoke-reconcile {}", job.binding.obligation));
+        Ok(())
+    }
+    fn sbx_smoke_probe(
+        &self,
+        target: &super::runtime_smoke::sbx::Target,
+        _min: &str,
+    ) -> Step<super::runtime_smoke::sbx::CliIdentity> {
+        let id = match target {
+            super::runtime_smoke::sbx::Target::Local => "sbx.macos-arm64",
+            super::runtime_smoke::sbx::Target::Ssh { .. } => "sbx.linux-x64",
+        };
+        let s = self.dir.load();
+        if let Some(reason) = s.script.sbx_smoke_unavailable.get(id) {
+            return Err(Stop::new("sbx-smoke-blocked", reason));
+        }
+        if let super::runtime_smoke::sbx::Target::Ssh { destination } = target {
+            if s.script.unreachable.contains(destination) {
+                return Err(Stop::new("sbx-smoke-blocked", "linux-host-unreachable"));
+            }
+        }
+        self.sbx_smoke_identity(target)
+    }
+    fn sbx_smoke_identity(
+        &self,
+        _target: &super::runtime_smoke::sbx::Target,
+    ) -> Step<super::runtime_smoke::sbx::CliIdentity> {
+        let s = self.dir.load();
+        Ok(super::runtime_smoke::sbx::CliIdentity {
+            path: "/fake/sbx".into(),
+            version: s.script.sbx_smoke_version.unwrap_or("0.54.1".into()),
+            sha256: "e".repeat(64),
+        })
+    }
+    fn sbx_smoke_start(
+        &self,
+        job: super::runtime_smoke::sbx::SbxSmokeJob,
+    ) -> Step<std::thread::JoinHandle<Step<super::runtime_smoke::sbx::SbxSmokeRecord>>> {
+        // Materialize synchronously: the virtual clock must not race directory mutations.
+        let result = super::runtime_smoke::fake::run(self, &job);
+        Ok(std::thread::spawn(move || result))
+    }
+    fn sbx_smoke_verify(
+        &self,
+        job: &super::runtime_smoke::sbx::SbxSmokeJob,
+    ) -> Step<super::runtime_smoke::sbx::SbxSmokeRecord> {
+        super::runtime_smoke::fake::verify(job)
+    }
     fn sbx_qualification(&self) -> Step<super::sbx::Qualification> {
         let s = self.dir.load();
         if let Some(code) = s.script.sbx_unavailable {
@@ -1416,6 +1467,13 @@ pub struct FakeHost {
 }
 
 impl NativeHost for FakeHost {
+    fn cancel(&self, job: &NativeJob, _world: &World) -> Step {
+        self.dir.call(format!("native-cancel {}", job.plan.id));
+        for name in ["lease.json", "intent.json"] {
+            let _ = std::fs::remove_file(job.out_dir.join(name));
+        }
+        Ok(())
+    }
     fn describe(&self) -> String {
         self.destination.clone()
     }
@@ -1562,6 +1620,14 @@ impl NativeHost for FakeHost {
                 )?;
             }
             body["sbx"] = super::sbx::collect(&job.out_dir, &q)?;
+        }
+        if [
+            crate::manifest::release_policy::APPLE_NATIVE,
+            crate::manifest::release_policy::DOCKER_NATIVE,
+        ]
+        .contains(&id.as_str())
+        {
+            super::runtime_smoke::fake::native(job, &mut body)?;
         }
         let result = job.out_dir.join("result.json");
         std::fs::write(&result, serde_json::to_vec_pretty(&body).unwrap())

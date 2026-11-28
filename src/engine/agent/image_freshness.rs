@@ -543,9 +543,9 @@ mod project_tag_tests {
     use awman_test_support::{TestCase, TestSandbox};
 
     #[tokio::test]
-    async fn docker_agent_builds_bind_the_inspected_project_image() {
+    async fn ready_and_stale_agent_builds_pin_the_local_project_image() {
         let s = TestSandbox::for_test(TestCase::component(
-            "engine::agent::image_freshness::project_tag_tests::docker_agent_builds_bind_the_inspected_project_image",
+            "engine::agent::image_freshness::project_tag_tests::ready_and_stale_agent_builds_pin_the_local_project_image",
         ));
         let root = s.work();
         std::fs::create_dir_all(root.join(".awman")).unwrap();
@@ -571,7 +571,7 @@ mod project_tag_tests {
         )
         .unwrap()
         .unwrap();
-        runtime.install(&project_tag, Some(project_inputs.as_str()));
+        let project_id = runtime.install(&project_tag, Some(project_inputs.as_str()));
         let tag = agent_image_tag(&root, "claude");
         let context = ImageBuildContext {
             git_root: root.clone(),
@@ -586,7 +586,6 @@ mod project_tag_tests {
         )
         .await
         .unwrap();
-        let project_id = runtime.id(&project_tag).unwrap();
         assert!(runtime.recipes.lock().unwrap()[0].starts_with(&format!("FROM {project_id}\n")));
 
         std::fs::write(

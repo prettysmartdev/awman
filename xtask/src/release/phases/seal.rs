@@ -41,6 +41,14 @@ pub fn expiry(ctx: &Ctx) -> Step {
             ctx.j.native.get(&n.id).and_then(|r| r.finished),
         ));
     }
+    if let Some(selection) = &ctx.j.sbx_selection {
+        for h in &selection.hosts {
+            times.push((
+                h.id.clone(),
+                ctx.j.sbx_smoke.get(&h.id).and_then(|r| r.finished),
+            ));
+        }
+    }
     if let Some((what, _)) = times.iter().find(|(_, t)| t.is_none()) {
         stop!(
             "evidence-expired",
@@ -223,6 +231,7 @@ pub fn seal(ctx: &mut Ctx) -> Step {
             "hosted evidence is incomplete; nothing is sealed"
         );
     }
+    crate::release::runtime_smoke::verify(ctx)?;
     expiry(ctx)?;
     ctx.event("rechecking retained CI and build evidence");
     super::hosted::verify_hosted_records(ctx)?;
@@ -370,6 +379,10 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
         "\n========== PUBLICATION CONFIRMATION ==========\nRelease {} — ready to publish\n  commit   {}\n  tree     {}\n  landing  {landing}\n  seal     sha256:{digest}\n",
         ctx.j.version, ctx.j.commit, ctx.j.tree
     );
+    s.push_str(&format!(
+        "  KVM/Docker host: {}\n",
+        ctx.j.linux_host.as_deref().unwrap_or("not recorded")
+    ));
     for a in &seal.assets {
         let att = ctx
             .j
@@ -392,7 +405,7 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
         ctx.j.ci.run_attempt
     ));
     for (id, n) in &ctx.j.native {
-        s.push_str(&format!("  {id:<20} {}", n.outcome));
+        s.push_str(&format!("  {id:<20} {}", n.outcome.to_uppercase()));
         if let Some(q) = &n.sbx {
             s.push_str(&format!(
                 " (sbx {}, operator label {})",
@@ -400,8 +413,38 @@ pub fn confirm(ctx: &mut Ctx) -> Step {
                 q["operator_label"].as_str().unwrap_or("?")
             ));
         }
+        if let Some(service) = &n.service {
+            s.push_str(&format!(
+                " (service {}, CLI {}, version {}, digest {})",
+                service["kind"].as_str().unwrap_or("?"),
+                service["cli_path"].as_str().unwrap_or("?"),
+                service["server_version"]
+                    .as_str()
+                    .or_else(|| service["service_version"].as_str())
+                    .unwrap_or("?"),
+                service["cli_sha256"].as_str().unwrap_or("?")
+            ));
+        }
         s.push('\n');
     }
+    for (id, r) in &ctx.j.sbx_smoke {
+        s.push_str(&format!(
+            "  {id}: {} (sbx {}, digest {})\n",
+            r.outcome.to_uppercase(),
+            r.cli_version.as_deref().unwrap_or("?"),
+            r.cli_sha256.as_deref().unwrap_or("?")
+        ));
+    }
+    if ctx
+        .j
+        .sbx_selection
+        .as_ref()
+        .is_some_and(|selection| !selection.hosts.iter().any(|h| h.host == "ssh"))
+    {
+        s.push_str("  sbx.linux-x64: NOT SELECTED (LINUX_HOST was not explicit)\n");
+    }
+    s.push_str(crate::release::runtime_smoke::sbx::LIMITS);
+    s.push('\n');
     for line in crate::release::status::advisories(ctx.w, &ctx.plan.ci.workflow) {
         s.push_str(&format!("  {line}\n"));
     }

@@ -152,6 +152,8 @@ pub struct NativeRecord {
     pub host: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sbx: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -227,6 +229,13 @@ pub struct Journal {
     pub builds: BTreeMap<String, BuildRecord>,
     #[serde(default)]
     pub native: BTreeMap<String, NativeRecord>,
+    #[serde(default)]
+    pub(crate) sbx_selection: Option<super::runtime_smoke::sbx::SbxSelection>,
+    /// Frozen KVM/Docker SSH destination; separate from explicit SBX selection.
+    #[serde(default)]
+    pub(crate) linux_host: Option<String>,
+    #[serde(default)]
+    pub(crate) sbx_smoke: BTreeMap<String, super::runtime_smoke::sbx::SbxSmokeRecord>,
     #[serde(default)]
     pub release: ReleaseRecord,
 }
@@ -334,7 +343,14 @@ impl Store {
     pub fn open(dir: &Path) -> Step<Store> {
         private_dir(dir).map_err(|e| Stop::new("state-corrupt", format!("{e:#}")))?;
         for sub in [
-            "assets", "kits", "native", "evidence", "logs", "ci", "fixtures",
+            "assets",
+            "kits",
+            "native",
+            "sbx-smoke",
+            "evidence",
+            "logs",
+            "ci",
+            "fixtures",
         ] {
             private_dir(&dir.join(sub))
                 .map_err(|e| Stop::new("state-corrupt", format!("{e:#}")))?;

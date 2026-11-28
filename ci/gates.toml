@@ -119,7 +119,7 @@ allowed_capabilities = ["docker", "apple-containers", "previous-release", "local
 [tiers.artifact]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]
-allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network"]
+allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network", "docker", "apple-containers"]
 
 [tiers.soak]
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary"]
@@ -1430,3 +1430,83 @@ fixtures = []
 budget_seconds = 1500
 required = false
 
+
+[suites.artifact-apple-smoke]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-apple-smoke"]
+requires = ["apple-containers", "guest-fixtures"]
+paths = ["src/**", "tests/artifact/apple_smoke/**", "tests/artifact/support/**"]
+filter = "test(=apple_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container)"
+budget_seconds = 420
+serial = true
+group = "apple"
+
+[release.native."native.macos-arm64-apple"]
+asset = "awman-macos-arm64"
+host = "local"
+suites = ["artifact-apple-smoke"]
+fixtures = ["guest-oci-base"]
+budget_seconds = 480
+required = true
+
+[[release_critical]]
+id = "artifact.apple-container-session"
+suite = "artifact-apple-smoke"
+tests = ["awman-cli::artifact apple_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"]
+gates = []
+not_overridable = true
+
+[suites.artifact-docker-smoke]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-docker-smoke"]
+requires = ["docker", "guest-fixtures"]
+paths = ["src/**", "tests/artifact/docker_smoke/**", "tests/artifact/support/**"]
+filter = "test(=docker_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container)"
+budget_seconds = 420
+serial = true
+group = "docker"
+
+[release.native."native.linux-x64-docker"]
+asset = "awman-linux-amd64"
+host = "ssh"
+suites = ["artifact-docker-smoke"]
+fixtures = ["guest-oci-base-amd64"]
+budget_seconds = 480
+required = true
+
+[[release_critical]]
+id = "artifact.docker-container-session"
+suite = "artifact-docker-smoke"
+tests = ["awman-cli::artifact docker_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"]
+gates = []
+not_overridable = true
+
+[release.sbx_smoke."sbx.macos-arm64"]
+asset = "awman-macos-arm64"
+triple = "aarch64-apple-darwin"
+host = "local"
+selection = "always"
+steps = ["version", "session", "create", "inspect", "exec", "run", "stop", "restart", "remove", "cleanup"]
+ready_agent = "claude"
+min_cli_version = "0.54.0"
+lifecycle_budget_seconds = 600
+ready_budget_seconds = 420
+budget_seconds = 1080
+
+[release.sbx_smoke."sbx.linux-x64"]
+asset = "awman-linux-amd64"
+triple = "x86_64-unknown-linux-gnu"
+host = "ssh"
+selection = "explicit-linux-host"
+steps = ["version", "session", "create", "inspect", "exec", "run", "stop", "restart", "remove", "cleanup"]
+ready_agent = "claude"
+min_cli_version = "0.54.0"
+lifecycle_budget_seconds = 600
+ready_budget_seconds = 420
+budget_seconds = 1080

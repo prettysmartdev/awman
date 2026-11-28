@@ -270,6 +270,8 @@ pub struct Release {
     pub workflow: String,
     pub smoke_suites: Vec<String>,
     pub native: BTreeMap<String, Native>,
+    #[serde(default)]
+    pub sbx_smoke: BTreeMap<String, SbxSmoke>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -293,4 +295,20 @@ pub struct Native {
     pub previous_release: Option<String>,
     pub budget_seconds: u64,
     pub required: bool,
+}
+
+/// Lightweight lifecycle and readiness, without provider tasks or credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SbxSmoke {
+    pub asset: String,
+    pub triple: String,
+    pub host: String,
+    pub selection: String,
+    pub steps: Vec<String>,
+    pub ready_agent: String,
+    pub min_cli_version: String,
+    pub lifecycle_budget_seconds: u64,
+    pub ready_budget_seconds: u64,
+    pub budget_seconds: u64,
 }

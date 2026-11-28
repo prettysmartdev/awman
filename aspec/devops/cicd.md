@@ -68,11 +68,19 @@ authenticated evidence proves every required cell at the exact release commit.
 **What blocks a release.** (1) The `release` gate. (2) For each of the four
 shipping assets, an attested build by `release.yml`, then the three exact-byte
 smoke suites (smoke, entrypoints, access reduction) on that asset's hosted OS.
-(3) Two native checks on operator machines, narrowed to the tests named in
+(3) Four native checks on operator machines, narrowed to the tests named in
 the release plan: signed offline boot and persisted-state upgrade of the macOS
-asset and offline KVM boot of the Linux amd64 asset. Experimental SBX provider smoke is an opt-in diagnostic and does not gate release. (4) Anonymous verification
-of the published bytes. Nothing else blocks; the evidence is verified by
-`cargo xtask gates verify-release-evidence`, never trusted from a summary.
+asset, an Apple Containers session with it (suite `artifact-apple-smoke`),
+offline KVM boot of the Linux amd64 asset and a Docker session with it (suite
+`artifact-docker-smoke`). (4) The release-owned SBX smoke on the Mac, and on
+the Linux host when `LINUX_HOST` was explicitly set as the attempt was pinned
+(`[release.sbx_smoke.*]` in the manifest). The SBX provider artifact smoke is an
+opt-in diagnostic and does not gate release. (5) Anonymous verification of the
+published bytes. Nothing else blocks. CI evidence is verified by
+`cargo xtask gates verify-release-evidence`, and native and SBX results are
+re-derived from their raw files by the release command; neither is trusted from
+a summary. The new Apple and Docker suites appear in no gate cell, so the
+`release` gate's cell set is unchanged.
 
 **What moved off the release path, and where it runs now.**
 
@@ -119,7 +127,7 @@ reported as passed because it was skipped.
 |---|---|---|
 | `ci.yml` (generated) | pull request, merge group, push to `main`, `workflow_call`, `workflow_dispatch` (`gate` is `pr`, `main` or `release`; `ref`, `key`) | the `pr`, `main` and `release` gates, and the base of `nightly` |
 | `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
-| `release.yml` | `workflow_dispatch` (`asset`, `version`, `commit`, `key`) | one asset per run on hosted runners: `produce` builds, signs and attests the exact bytes and the native kit; `validate` verifies the attestation, smoke-tests those bytes and writes the build record |
+| `release.yml` | `workflow_dispatch` (`asset`, `version`, `commit`, `key`) | one asset per run on hosted runners: `produce` builds, signs and attests the exact bytes and its native kits (two each for `awman-macos-arm64` and `awman-linux-amd64`); `validate` verifies the attestation, smoke-tests those bytes and writes the build record |
 | `fixtures.yml` | `workflow_dispatch` | pull the reviewed Alpine digest, derive and attest the architecture-specific (arm64 and amd64) guest fixtures, publish an immutable fixture prerelease that is never marked Latest |
 
 Fixture releases use `fixtures-<source commit>` tags and remain downloadable by
@@ -238,11 +246,13 @@ No workflow uses a self-hosted runner, an environment, a release secret or a
 local `uses: ./` action in `release.yml`; the workflow lint rejects each.
 
 - Hosted VMs cannot boot a guest (macOS guests cannot nest Hypervisor.framework).
-  Guest boot is therefore done by the release command on the operator's Apple
-  Silicon Mac and on a Linux KVM host reached over SSH, not by a runner. Those
-  hosts execute the already attested bytes from a prebuilt, digest-bound kit; no
-  checkout, Cargo or compile happens on them, and no GitHub token is sent to
-  the Linux host. Their results are operator evidence, not Actions attestations.
+  Guest boot and the Apple Containers, Docker and SBX smokes are therefore done
+  by the release command on the operator's Apple Silicon Mac and on a Linux
+  host reached over SSH, not by a runner. Those hosts execute the already
+  attested bytes, from a prebuilt, digest-bound kit for the native checks and
+  from the verified asset plus a fixed script for SBX; no checkout, Cargo or
+  compile happens on them, and no GitHub token is sent to the Linux host. Their
+  results are operator evidence, not Actions attestations.
 - `release.yml` has top-level `contents: read`. Only the `produce` job holds
   `id-token` and `attestations` write, and `validate` only reads. Neither can
   create a release; the operator's login does that.
@@ -308,7 +318,7 @@ see [testing.md](testing.md#reproducing-a-ci-failure).
 
 ## Evidence limits
 
-The three required native checks run only through `make release`, on exact attested bytes, and a missing, blocked or short result prevents sealing. No hosted-Mac compilation or Linux pass is native runtime proof. `make validate-native` is a broad operator diagnostic whose evidence directory is checked with `cargo xtask native-validation verify DIR`; it is not part of a release and cannot authorize one. Guest fixtures are pinned to published, architecture-specific archives; a pending pin blocks. Native results are operator evidence, not Actions attestations. Real native boot and upgrade, SSH transport, the Windows firewall and complete publication timing are measured separately in [release-measurements.md](release-measurements.md), not claimed by the local tests.
+The four required native checks and the selected SBX smokes run only through `make release`, on exact attested bytes, and a missing, blocked or short result prevents sealing. No hosted-Mac compilation or Linux pass is native runtime proof. `make validate-native` is a broad operator diagnostic whose evidence directory is checked with `cargo xtask native-validation verify DIR`; it is not part of a release and cannot authorize one. Guest fixtures are pinned to published, architecture-specific archives; a pending pin blocks. Native results are operator evidence, not Actions attestations. Real native boot and upgrade, the real Apple Containers, Docker and SBX services, SSH transport, the Windows firewall and complete publication timing are measured separately in [release-measurements.md](release-measurements.md), not claimed by the local tests.
 
 Coverage and mutation results are diagnostics. Performance reports must distinguish cold builds, warm runs and queue time; a single run does not establish p95 or a flake rate. Dependency advisories are reviewed separately from the licenses, bans and sources gate.
 

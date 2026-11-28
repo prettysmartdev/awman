@@ -33,6 +33,10 @@ pub struct ClaimDoc {
     pub push_ref: String,
     pub owner: Owner,
     #[serde(default)]
+    pub(crate) sbx_selection: Option<super::runtime_smoke::sbx::SbxSelection>,
+    #[serde(default)]
+    pub(crate) linux_host: Option<String>,
+    #[serde(default)]
     pub previous_owners: Vec<Owner>,
     #[serde(default)]
     pub ci_run: Option<u64>,
@@ -68,6 +72,8 @@ impl ClaimDoc {
     pub fn from_journal(j: &Journal, previous: Vec<Owner>) -> ClaimDoc {
         ClaimDoc {
             schema: 1,
+            sbx_selection: j.sbx_selection.clone(),
+            linux_host: j.linux_host.clone(),
             repository_id: j.repository_id,
             version: j.version.clone(),
             mode: j.mode().into(),
@@ -150,13 +156,43 @@ pub fn release_evidence(j: &Journal) -> serde_json::Value {
             id.clone(),
             if n.outcome == "passed" {
                 "passed"
+            } else if n.outcome == "blocked" {
+                "blocked"
             } else {
                 "failed"
             },
         );
     }
+    for id in [
+        crate::manifest::release_policy::SBX_SMOKE_MAC,
+        crate::manifest::release_policy::SBX_SMOKE_LINUX,
+    ] {
+        let selected = j
+            .sbx_selection
+            .as_ref()
+            .is_some_and(|s| s.hosts.iter().any(|h| h.id == id));
+        gates.insert(
+            id.into(),
+            if selected {
+                j.sbx_smoke
+                    .get(id)
+                    .map(|r| r.outcome.as_str())
+                    .unwrap_or("pending")
+            } else {
+                "not-selected"
+            },
+        );
+    }
     serde_json::json!({
         "schema": 1,
+        "sbx_selection": j.sbx_selection,
+        "linux_host": j.linux_host,
+        "native_ssh_destinations": j.native.keys()
+            .filter(|id| id.starts_with("native.linux-"))
+            .map(|id| (id.clone(), j.linux_host.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        "sbx_smoke": j.sbx_smoke,
+        "sbx_limits": super::runtime_smoke::sbx::LIMITS,
         "version": j.version,
         "repository": j.repo,
         "repository_id": j.repository_id,

@@ -33,6 +33,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
     match args.first().map(String::as_str) {
         Some("kit") => kit::build(&root, &args[1..]),
         Some("kit-run") => kit::run(&args[1..]),
+        Some("kit-reconcile") => kit::reconcile(&args[1..]),
         Some("install-runner") => install_runner(&root),
         Some("run") => run_suites(&root, &Options::parse(&args[1..])?),
         Some("list") => list(&root, &Options::parse(&args[1..])?),

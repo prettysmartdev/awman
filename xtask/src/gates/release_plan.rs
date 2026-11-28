@@ -58,10 +58,20 @@ pub fn create(m: &Manifest) -> Result<Value> {
             }),
             "budget_seconds":n.budget_seconds,"required":n.required,"kit_artifact":format!("native-kit-{id}")}))
     }).collect::<Result<Vec<_>>>()?;
+    let sbx_smoke = m
+        .release
+        .sbx_smoke
+        .iter()
+        .map(|(id, p)| {
+            let mut v = serde_json::to_value(p).expect("serializable SBX plan");
+            v["id"] = json!(id);
+            v
+        })
+        .collect::<Vec<_>>();
     Ok(
         json!({"schema":1,"manifest_sha256":m.version(),"policy_sha256":crate::manifest::release_policy::digest(m)?,"evidence_validity_days":m.release.evidence_valid_days,"gate":"release",
         "ci":{"workflow":"ci.yml","inputs":{"gate":"release"},"evidence_artifact_prefix":"gate-evidence-","evidence_file":"gate-evidence.json"},
-        "release_workflow":"release.yml","checksums":m.release.checksums,"evidence":m.release.evidence,"assets":assets,"native":native}),
+        "release_workflow":"release.yml","checksums":m.release.checksums,"evidence":m.release.evidence,"assets":assets,"native":native,"sbx_smoke":sbx_smoke}),
     )
 }
 

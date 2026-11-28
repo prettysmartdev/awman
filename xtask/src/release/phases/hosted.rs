@@ -862,7 +862,7 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
     Ok(true)
 }
 
-fn job(ctx: &Ctx, id: &str) -> Step<Option<NativeJob>> {
+pub(crate) fn job(ctx: &Ctx, id: &str) -> Step<Option<NativeJob>> {
     let Some(n) = ctx.plan.native(id).cloned() else {
         return Ok(None);
     };
@@ -970,6 +970,35 @@ fn natives_tick(ctx: &mut Ctx) -> Step {
         }
         let Some(job) = job(ctx, &id)? else { continue };
         if !ctx.hosts.contains_key(&id) {
+            let active = ctx
+                .hosts
+                .keys()
+                .filter(|n| {
+                    ctx.plan.native(n).is_some_and(|p| p.host == job.plan.host)
+                        && !ctx
+                            .j
+                            .native
+                            .get(*n)
+                            .is_some_and(|r| r.outcome == "passed" || r.outcome == "failed")
+                        && !ctx
+                            .deferred
+                            .iter()
+                            .any(|d| d.message.starts_with(&format!("{n}:")))
+                })
+                .count();
+            let sbx_active = ctx
+                .sbx_workers
+                .keys()
+                .filter(|s| {
+                    ctx.plan
+                        .sbx_smoke
+                        .iter()
+                        .any(|p| &p.id == *s && p.host == job.plan.host)
+                })
+                .count();
+            if active + sbx_active >= 2 {
+                continue;
+            }
             let host = ctx.w.hosts.host(&job.plan, ctx.linux_host.as_deref())?;
             ctx.store
                 .log("native", &format!("{id} runs on {}", host.describe()));
@@ -990,15 +1019,28 @@ fn natives_tick(ctx: &mut Ctx) -> Step {
                 Err(stop) => {
                     // A failed/invalid result is retained for review but
                     // never counts as passed.
-                    let kept = path
-                        .with_extension(format!("rejected-{}.json", ctx.w.clock.now().timestamp()));
-                    let _ = std::fs::rename(&path, &kept);
-                    let _ = std::fs::remove_file(job.out_dir.join("exit"));
-                    if stop.kind == crate::release::error::Kind::Failed {
+                    let retained = ctx.store.path(&format!(
+                        "native/{id}-rejected-{}",
+                        crate::release::util::random_id()?
+                    ));
+                    std::fs::rename(&job.out_dir, &retained).map_err(anyhow::Error::from)?;
+                    crate::release::util::private_dir(&job.out_dir)?;
+                    let kept = retained.join(path.file_name().ok_or_else(|| {
+                        Stop::new("native-result-invalid", "result has no file name")
+                    })?);
+                    if matches!(
+                        stop.kind,
+                        crate::release::error::Kind::Failed | crate::release::error::Kind::Blocked
+                    ) {
                         ctx.j.native.insert(
                             id.clone(),
                             crate::release::journal::NativeRecord {
-                                outcome: "failed".into(),
+                                outcome: if stop.kind == crate::release::error::Kind::Failed {
+                                    "failed"
+                                } else {
+                                    "blocked"
+                                }
+                                .into(),
                                 result_sha256: sha256_file(&kept).unwrap_or_default(),
                                 asset_sha256: job.asset_sha256.clone(),
                                 kit_sha256: job.kit_sha256.clone(),
@@ -1015,10 +1057,25 @@ fn natives_tick(ctx: &mut Ctx) -> Step {
                 }
             },
             Err(stop) if stop.kind == crate::release::error::Kind::Killed => return Err(stop),
-            Err(stop) => ctx.deferred.push(Stop {
-                message: format!("{id}: {}", stop.message),
-                ..stop
-            }),
+            Err(stop) => {
+                if stop.kind == crate::release::error::Kind::Failed {
+                    ctx.j.native.insert(
+                        id.clone(),
+                        crate::release::journal::NativeRecord {
+                            outcome: "failed".into(),
+                            asset_sha256: job.asset_sha256.clone(),
+                            kit_sha256: job.kit_sha256.clone(),
+                            reason: Some(stop.message.clone()),
+                            ..Default::default()
+                        },
+                    );
+                    ctx.save()?;
+                }
+                ctx.deferred.push(Stop {
+                    message: format!("{id}: {}", stop.message),
+                    ..stop
+                });
+            }
         }
     }
     Ok(())
@@ -1034,6 +1091,7 @@ pub fn collect(ctx: &mut Ctx) -> Step {
             done &= step_build(ctx, a)?;
         }
         natives_tick(ctx)?;
+        crate::release::runtime_smoke::tick(ctx)?;
         report_hosted(ctx);
         if done {
             return Ok(());
@@ -1052,6 +1110,7 @@ pub fn native_phase(ctx: &mut Ctx) -> Step {
     loop {
         ctx.w.interrupted()?;
         natives_tick(ctx)?;
+        crate::release::runtime_smoke::tick(ctx)?;
         for n in &ctx.plan.native {
             if let Some(record) = ctx.j.native.get(&n.id) {
                 ctx.progress(&n.id, format!("native {}: {}", n.id, record.outcome));
@@ -1065,17 +1124,20 @@ pub fn native_phase(ctx: &mut Ctx) -> Step {
                 .get(&n.id)
                 .is_some_and(|r| r.outcome == "passed")
         });
-        if all {
+        if all && crate::release::runtime_smoke::complete(ctx) {
             return Ok(());
         }
         let open = ctx.plan.native.iter().any(|n| {
-            !ctx.j.native.contains_key(&n.id)
+            !ctx.j
+                .native
+                .get(&n.id)
+                .is_some_and(|r| r.outcome == "passed" || r.outcome == "failed")
                 && !ctx
                     .deferred
                     .iter()
                     .any(|d| d.message.starts_with(&format!("{}:", n.id)))
         });
-        if !open {
+        if !open && !crate::release::runtime_smoke::pending(ctx) {
             // Report the first cause; completed checks stay recorded.
             return Err(ctx.deferred.remove(0));
         }

@@ -56,6 +56,7 @@ pub struct NativeJob {
 }
 
 pub trait NativeHost {
+    fn cancel(&self, job: &NativeJob, world: &super::world::World) -> Step;
     fn describe(&self) -> String;
     /// Preflight: every capability this host needs, before long work.
     fn probe(&self, plan: &NativePlan) -> Step;
@@ -312,6 +313,9 @@ pub fn verify_result(job: &NativeJob, path: &Path, exit: i32) -> Step<NativeReco
     let record = |outcome: &str| -> Step<NativeRecord> {
         Ok(NativeRecord {
             sbx: read_json::<serde_json::Value>(path)?.get("sbx").cloned(),
+            service: read_json::<serde_json::Value>(path)?
+                .get("service")
+                .cloned(),
             outcome: outcome.into(),
             result_sha256: sha256_file(path)?,
             asset_sha256: r.artifact_sha256.clone(),
@@ -449,6 +453,10 @@ fn read_lease(job: &NativeJob, host: &str) -> Step<Option<Lease>> {
             check_host(job, &lease.host, host)?;
             Ok(Some(lease))
         }
+        Err(e) if std::fs::symlink_metadata(lease_path(job)).is_ok() => Err(Stop::new(
+            "state-corrupt",
+            format!("{} has an unreadable ownership lease: {e:#}", job.plan.id),
+        )),
         Err(_) => Ok(None),
     }
 }
@@ -741,7 +749,13 @@ impl LocalHost {
     ) -> Step<bool> {
         let root = PathBuf::from(&intent.root);
         if std::fs::symlink_metadata(&root).is_err() {
-            return Ok(false);
+            let parked = PathBuf::from(format!("{}.abandoned", intent.root));
+            if self.owns(&parked, &intent.allocation) {
+                crate::test::isolation::cleanup_owned_processes(&root);
+                std::fs::rename(&parked, &root).map_err(anyhow::Error::from)?;
+            } else {
+                return Ok(false);
+            }
         }
         if !self.owns(&root, &intent.allocation) {
             forget(job);
@@ -773,6 +787,22 @@ impl LocalHost {
             None => {
                 crate::test::isolation::cleanup_owned_processes(&root);
             }
+        }
+        if [
+            crate::manifest::release_policy::APPLE_NATIVE,
+            crate::manifest::release_policy::DOCKER_NATIVE,
+        ]
+        .contains(&job.plan.id.as_str())
+        {
+            // Processes are stopped. Restore the reservation's canonical scratch path
+            // for reconciliation; retain the intent and directory on any failure.
+            if stale != root {
+                std::fs::rename(&stale, &root).map_err(anyhow::Error::from)?;
+            }
+            cleanup_runtime_allocation(job, &root)?;
+            keep_evidence(&root.join("out"), &job.out_dir)?;
+            self.remove_root(&intent.root, &intent.allocation);
+            return Ok(false);
         }
         if job.plan.id == crate::manifest::release_policy::SBX_NATIVE {
             super::sbx::cleanup(&stale.join("out"), &root.join("tmp")).map_err(|e| {
@@ -870,6 +900,7 @@ impl LocalHost {
             // Our own unreaped child: its PID cannot have been reused.
             kill_group(pid);
             crate::test::isolation::cleanup_owned_processes(&root);
+            cleanup_runtime_allocation(job, &root)?;
             self.remove_root(&intent.root, &intent.allocation);
             forget(job);
             return Err(Stop::new(
@@ -889,7 +920,7 @@ impl LocalHost {
     /// Stop, remove and forget the leased allocation.
     fn discard(&self, job: &NativeJob, lease: &Lease) -> Step {
         self.stop_owned(lease);
-        cleanup_sbx_allocation(job, Path::new(&lease.root))?;
+        cleanup_runtime_allocation(job, Path::new(&lease.root))?;
         self.remove_root(&lease.root, &lease.allocation);
         forget(job);
         Ok(())
@@ -910,6 +941,28 @@ fn which(tool: &str) -> bool {
 }
 
 impl NativeHost for LocalHost {
+    fn cancel(&self, job: &NativeJob, world: &super::world::World) -> Step {
+        if let Some(lease) = read_lease(job, "local")? {
+            if !valid_allocation(&lease.allocation)
+                || Path::new(&lease.root) != self.allocation_root(&lease.allocation)
+            {
+                return Err(Stop::new("state-corrupt", "invalid local cleanup lease"));
+            }
+            return self.discard(job, &lease);
+        }
+        if intent_path(job).exists() {
+            let intent = load_intent(job, "local", String::new(), |a| {
+                self.allocation_root(a).to_string_lossy().into()
+            })?;
+            if self.adopt_or_clean(job, world, &intent)? {
+                let lease = read_lease(job, "local")?
+                    .ok_or_else(|| Stop::new("state-corrupt", "adopted cleanup has no lease"))?;
+                self.discard(job, &lease)?;
+            }
+            forget(job);
+        }
+        Ok(())
+    }
     fn describe(&self) -> String {
         "this Mac".into()
     }
@@ -926,6 +979,20 @@ impl NativeHost for LocalHost {
         }
         if plan.id == crate::manifest::release_policy::SBX_NATIVE {
             super::sbx::probe().map_err(Stop::from)?;
+            return Ok(());
+        }
+        if plan.id == crate::manifest::release_policy::APPLE_NATIVE {
+            let mut command = Command::new("container");
+            command.args(["system", "status"]);
+            let out =
+                super::util::output_bounded(&mut command, None, std::time::Duration::from_secs(20))
+                    .map_err(|e| Stop::new("apple-service-unavailable", e.to_string()))?;
+            if !out.status.success() {
+                return Err(Stop::new(
+                    "apple-service-unavailable",
+                    "container system status failed",
+                ));
+            }
             return Ok(());
         }
         let hv = Command::new("sysctl")
@@ -1037,11 +1104,11 @@ impl NativeHost for LocalHost {
             if !leaked.is_empty() {
                 record_leak(job, &format!("pids {leaked:?}"))?;
             }
-            if cleanup_sbx_allocation(job, &root)? {
+            keep_evidence(&out, &job.out_dir)?;
+            if cleanup_runtime_allocation(job, &root)? {
                 record_leak(job, "owned SBX sandbox survived the kit runner")?;
             }
-            // Kept for review even when a leak voids it.
-            keep_evidence(&out, &job.out_dir)?;
+            // Original raw evidence was retained before reconciliation.
             self.remove_root(&lease.root, &lease.allocation);
             forget(job);
             if let Some(leak) = recorded_leak(job) {
@@ -1059,7 +1126,7 @@ impl NativeHost for LocalHost {
         if world.clock.now() > lease.deadline {
             self.discard(job, &lease)?;
             return Err(Stop::new(
-                "timeout",
+                runtime_deadline_code(job),
                 format!(
                     "{} exceeded its {} s budget",
                     job.plan.id, job.deadline_seconds
@@ -1103,10 +1170,14 @@ sweep() {
   echo "swept=$n"
 }
 case $cmd in
+docker-probe)
+  command -v docker >/dev/null 2>&1 || { echo docker.server=no; exit 0; }
+  if timeout --kill-after=5 20 docker version --format '{{.Server.Version}}' > /dev/null 2>&1; then echo docker.server=yes; else echo docker.server=no; fi
+  ;;
 probe)
   echo "arch=$(uname -m)"
   if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo kvm=yes; else echo kvm=no; fi
-  for t in git setsid tar curl sha256sum ps; do
+  for t in git setsid tar curl sha256sum ps timeout; do
     if command -v "$t" >/dev/null 2>&1; then echo "tool.$t=yes"; else echo "tool.$t=no"; fi
   done
   echo "seccomp=$(grep -c '^Seccomp:' /proc/self/status 2>/dev/null || echo 0)"
@@ -1192,6 +1263,9 @@ cleanup)
   root=$1; owner=$2
   owned "$root" "$owner" || { echo swept=0; exit 0; }
   sweep "$root"
+  if [ -f "$root/out/runtime-owned.json" ]; then
+    timeout --kill-after=5 120 "$root/kit/bin/xtask" test kit-reconcile --kit "$root/kit" --out "$root/out" --tmproot "$root/tmp"
+  fi
   rm -rf -- "$root"
   ;;
 esac
@@ -1212,6 +1286,7 @@ pub fn ssh_deadline(op: &str) -> std::time::Duration {
         "receive" => 1800,
         // Kit extraction; result bundle download.
         "start" | "collect" => 300,
+        "cleanup" => 180,
         _ => 60,
     })
 }
@@ -1326,7 +1401,25 @@ impl SshHost {
     }
 
     fn cleanup(&self, root: &str, allocation: &str) -> Step {
-        self.ssh(&["cleanup", root, allocation], None).map(|_| ())
+        let out = self
+            .ssh(&["cleanup", root, allocation], None)
+            .map_err(|e| {
+                if e.code == "linux-host-prerequisite" {
+                    Stop::new(
+                        "native-result-invalid",
+                        format!("owned runtime cleanup failed: {}", e.message),
+                    )
+                } else {
+                    e
+                }
+            })?;
+        if kv(&out).get("leaked").is_some_and(|v| v != "0") {
+            return Err(Stop::new(
+                "native-result-invalid",
+                "owned runtime object survived the kit runner",
+            ));
+        }
+        Ok(())
     }
 
     /// Turn the supervisor's start handshake into the lease. An identity that
@@ -1367,6 +1460,22 @@ impl SshHost {
 }
 
 impl NativeHost for SshHost {
+    fn cancel(&self, job: &NativeJob, _world: &super::world::World) -> Step {
+        if let Some(lease) = read_lease(job, &self.destination)? {
+            if !valid_allocation(&lease.allocation)
+                || lease.root != Self::remote_root(&lease.allocation)
+            {
+                return Err(Stop::new("state-corrupt", "invalid remote cleanup lease"));
+            }
+            return self.discard(job, &lease);
+        }
+        if intent_path(job).exists() {
+            let intent = load_intent(job, &self.destination, String::new(), Self::remote_root)?;
+            self.cleanup(&intent.root, &intent.allocation)?;
+            forget(job);
+        }
+        Ok(())
+    }
     fn describe(&self) -> String {
         self.destination.clone()
     }
@@ -1390,7 +1499,17 @@ impl NativeHost for SshHost {
                 ),
             ));
         }
-        if get("kvm") != "yes" {
+        let docker = plan.id == crate::manifest::release_policy::DOCKER_NATIVE;
+        if docker {
+            let facts = kv(&self.ssh(&["docker-probe"], None)?);
+            if facts.get("docker.server").map(String::as_str) != Some("yes") {
+                return Err(Stop::new(
+                    "docker-daemon-unavailable",
+                    format!("Docker server is unavailable on {}", self.destination),
+                ));
+            }
+        }
+        if !docker && get("kvm") != "yes" {
             return Err(Stop::new(
                 "linux-host-prerequisite",
                 format!(
@@ -1399,7 +1518,7 @@ impl NativeHost for SshHost {
                 ),
             ));
         }
-        for t in ["git", "setsid", "tar", "curl", "sha256sum", "ps"] {
+        for t in ["git", "setsid", "tar", "curl", "sha256sum", "ps", "timeout"] {
             if get(&format!("tool.{t}")) != "yes" {
                 return Err(Stop::new(
                     "linux-host-prerequisite",
@@ -1407,7 +1526,7 @@ impl NativeHost for SshHost {
                 ));
             }
         }
-        if get("seccomp") == "0" {
+        if !docker && get("seccomp") == "0" {
             return Err(Stop::new(
                 "linux-host-prerequisite",
                 format!(
@@ -1514,7 +1633,7 @@ impl NativeHost for SshHost {
                 self.ssh(&with("kill"), None)?;
                 self.discard(job, &lease)?;
                 return Err(Stop::new(
-                    "timeout",
+                    runtime_deadline_code(job),
                     format!(
                         "{} exceeded its {} s budget on {}",
                         job.plan.id, job.deadline_seconds, self.destination
@@ -1669,7 +1788,43 @@ impl super::world::Hosts for RealHosts {
     }
 }
 
-fn cleanup_sbx_allocation(job: &NativeJob, root: &Path) -> Step<bool> {
+fn cleanup_runtime_allocation(job: &NativeJob, root: &Path) -> Step<bool> {
+    if [
+        crate::manifest::release_policy::APPLE_NATIVE,
+        crate::manifest::release_policy::DOCKER_NATIVE,
+    ]
+    .contains(&job.plan.id.as_str())
+        && root.join("out/runtime-owned.json").exists()
+    {
+        // Execute only the kit whose complete digest inventory was attested.
+        check_kit(&job.kit_dir, &job.plan, &job.commit)?;
+        let mut c = Command::new(job.kit_dir.join("bin/xtask"));
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.args(["test", "kit-reconcile", "--kit"])
+            .arg(&job.kit_dir)
+            .arg("--out")
+            .arg(root.join("out"))
+            .arg("--tmproot")
+            .arg(root.join("tmp"));
+        let output = super::util::output_bounded(&mut c, None, std::time::Duration::from_secs(120))
+            .map_err(|e| {
+                Stop::new(
+                    "native-result-invalid",
+                    format!("owned runtime cleanup: {e}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Stop::new(
+                "native-result-invalid",
+                "owned runtime object could not be removed",
+            ));
+        }
+        let count = kv(&output.stdout)
+            .get("leaked")
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| Stop::new("native-result-invalid", "missing owned cleanup receipt"))?;
+        return Ok(count > 0);
+    }
     if job.plan.id != crate::manifest::release_policy::SBX_NATIVE {
         return Ok(false);
     }
@@ -1679,6 +1834,19 @@ fn cleanup_sbx_allocation(job: &NativeJob, root: &Path) -> Step<bool> {
             format!("owned SBX cleanup failed: {e:#}"),
         )
     })
+}
+
+fn runtime_deadline_code(job: &NativeJob) -> &'static str {
+    if [
+        crate::manifest::release_policy::APPLE_NATIVE,
+        crate::manifest::release_policy::DOCKER_NATIVE,
+    ]
+    .contains(&job.plan.id.as_str())
+    {
+        "native-failed"
+    } else {
+        "timeout"
+    }
 }
 
 #[cfg(test)]

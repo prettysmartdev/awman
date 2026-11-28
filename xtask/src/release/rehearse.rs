@@ -128,6 +128,17 @@ fn complete(world: &Path, s: &Store, dispatches: usize) -> Vec<String> {
         }),
         "evidence does not list every selected native pass",
     );
+    let selected = &ev["sbx_selection"]["hosts"];
+    expect(
+        &mut e,
+        selected.as_array().is_some_and(|hosts| {
+            !hosts.is_empty()
+                && hosts
+                    .iter()
+                    .all(|h| ev["sbx_smoke"][h["id"].as_str().unwrap()]["outcome"] == "passed")
+        }),
+        "seal lost a selected SBX result",
+    );
     expect(
         &mut e,
         s.releases
@@ -140,7 +151,7 @@ fn complete(world: &Path, s: &Store, dispatches: usize) -> Vec<String> {
 }
 
 pub fn scenarios() -> Vec<Scenario> {
-    vec![
+    let mut scenarios = vec![
         Scenario {
             name: "experimental-sbx-does-not-gate-release",
             setup: |s| s.script.sbx_unavailable = Some("sbx-identity-missing".into()),
@@ -313,6 +324,11 @@ pub fn scenarios() -> Vec<Scenario> {
         Scenario {
             name: "sbx-interrupted",
             setup: |s| {
+                s.script
+                    .native
+                    .get_mut("native.macos-arm64-sbx")
+                    .unwrap()
+                    .run_s = 600;
                 s.faults
                     .push(fault("native_run:native.macos-arm64-sbx", 1, "crash"))
             },
@@ -520,7 +536,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 );
                 expect(
                     &mut e,
-                    count(s, "native-run native.linux-x64") == 2,
+                    count(s, "native-run native.linux-x64 on") == 2,
                     "the Linux check did not rerun exactly once",
                 );
                 e
@@ -546,7 +562,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 );
                 expect(
                     &mut e,
-                    count(s, "native-run native.linux-x64") == 1,
+                    count(s, "native-run native.linux-x64 on") == 1,
                     "the passed Linux check reran",
                 );
                 expect(
@@ -607,7 +623,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 let mut e = complete(w, s, 5);
                 expect(
                     &mut e,
-                    count(s, "native-run") == 2,
+                    count(s, "native-run") == 4,
                     "native checks reran after the seal",
                 );
                 e
@@ -654,7 +670,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 expect(&mut e, count(s, "tag ") == 1, "the tag was touched again");
                 expect(
                     &mut e,
-                    count(s, "native-run") == 2,
+                    count(s, "native-run") == 4,
                     "promotion retry reran native checks",
                 );
                 e
@@ -976,7 +992,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     &mut e,
                     journal(w)["native"]
                         .as_object()
-                        .is_some_and(|n| n.len() == 2),
+                        .is_some_and(|n| n.len() == 4),
                     "the rebuilt journal lost the sealed native records",
                 );
                 e
@@ -1109,7 +1125,9 @@ pub fn scenarios() -> Vec<Scenario> {
                 e
             },
         },
-    ]
+    ];
+    scenarios.extend(super::runtime_smoke::rehearsal::scenarios());
+    scenarios
 }
 
 /// The release workflow's transport steps as the classifier reads them at R.

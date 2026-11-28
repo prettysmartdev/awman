@@ -528,7 +528,8 @@ fn a_second_clone_is_locked_out_until_an_explicit_takeover() {
     ])
     .passed();
     assert_eq!(w.calls("dispatch "), 5, "the new owner reused every run");
-    assert_eq!(w.calls("native-run"), 2, "and every selected native result");
+    assert_eq!(w.calls("native-run"), 4, "and every selected native result");
+    assert_eq!(w.calls("sbx-smoke-run"), 2, "and both selected SBX results");
     assert!(w.published().is_some());
 }
 
@@ -609,54 +610,6 @@ fn the_seal_binds_the_exact_assets_and_the_checksums() {
 
 // ── every layer-1 rehearsal scenario, run through `release rehearse` ──────────
 
-const SCENARIOS: &[&str] = &[
-    "experimental-sbx-does-not-gate-release",
-    "sbx-qualification-changed-on-resume",
-    "sbx-qualification-changed-before-seal",
-    "sbx-retained-proof-tampered-on-requalification",
-    "sbx-pass",
-    "sbx-prerequisite-blocked",
-    "sbx-product-failed",
-    "sbx-kit-blocked",
-    "sbx-interrupted",
-    "sbx-evidence-tampered",
-    "clean",
-    "clean-reuse",
-    "transient-ci",
-    "product-ci",
-    "build-startup-failure",
-    "host-unreachable-preflight",
-    "host-lost-midway",
-    "native-interrupted",
-    "killed-before-claim",
-    "interrupted-collect",
-    "dispatch-response-lost",
-    "journal-lost",
-    "upload-partial",
-    "tag-response-lost",
-    "publish-retry",
-    "verify-retry",
-    "verify-mismatch",
-    "main-moved",
-    "main-moved-policy",
-    "main-conflict",
-    "controller-checkout-changed",
-    "tag-elsewhere",
-    "missing-build-record",
-    "missing-native-test",
-    "native-failed",
-    "second-owner",
-    "transport-step-retry",
-    "hosted-evidence-lost",
-    "hosted-evidence-unrecoverable",
-    "expired-journal-lost",
-    "expired-after-tag",
-    "receipt-lost",
-    "public-assets-lost",
-    "tag-annotation-lost",
-    "merge-absorbs-policy",
-];
-
 fn sandbox(id: &'static str) -> TestSandbox {
     let mut s = TestSandbox::for_test(TestCase::component(id));
     s.register_exe("xtask", Path::new(awman_test_support::cargo_bin!("xtask")));
@@ -726,6 +679,7 @@ fn rehearse(id: &'static str, scenario: &str) {
 
 macro_rules! scenario_tests {
     ($($name:ident => $scenario:literal,)*) => {
+        const SCENARIOS: &[&str] = &[$($scenario,)*];
         $(
             #[test]
             fn $name() {
@@ -782,6 +736,32 @@ scenario_tests! {
     rehearse_public_assets_lost => "public-assets-lost",
     rehearse_tag_annotation_lost => "tag-annotation-lost",
     rehearse_merge_absorbs_policy => "merge-absorbs-policy",
+    rehearse_runtime_sbx_supersede_interrupted => "runtime-sbx-supersede-interrupted",
+    rehearse_runtime_native_supersede_interrupted => "runtime-native-supersede-interrupted",
+    rehearse_runtime_native_duplicate_test => "runtime-native-duplicate-test",
+    rehearse_runtime_native_stale_kit => "runtime-native-stale-kit",
+    rehearse_runtime_native_stale_asset => "runtime-native-stale-asset",
+    rehearse_runtime_sbx_duplicate_step => "runtime-sbx-duplicate-step",
+    rehearse_runtime_sbx_stale_asset => "runtime-sbx-stale-asset",
+    rehearse_runtime_sbx_packet_tampered_before_seal => "runtime-sbx-packet-tampered-before-seal",
+    rehearse_runtime_smokes_pass_and_resume => "runtime-smokes-pass-and-resume",
+    rehearse_runtime_sbx_mac_only_with_saved_linux_host => "runtime-sbx-mac-only-with-saved-linux-host",
+    rehearse_runtime_sbx_linux_blocked => "runtime-sbx-linux-blocked",
+    rehearse_runtime_sbx_linux_preflight_blocked => "runtime-sbx-linux-preflight-blocked",
+    rehearse_runtime_sbx_failed_task => "runtime-sbx-failed-task",
+    rehearse_runtime_sbx_timeout => "runtime-sbx-timeout",
+    rehearse_runtime_sbx_cleanup_failure => "runtime-sbx-cleanup-failure",
+    rehearse_runtime_sbx_missing_step => "runtime-sbx-missing-step",
+    rehearse_runtime_sbx_interrupted => "runtime-sbx-interrupted",
+    rehearse_runtime_sbx_selection_substitution => "runtime-sbx-selection-substitution",
+    rehearse_runtime_sbx_selection_drop_unfinished => "runtime-sbx-selection-drop-unfinished",
+    rehearse_runtime_sbx_selection_omit_complete => "runtime-sbx-selection-omit-complete",
+    rehearse_runtime_sbx_selection_add => "runtime-sbx-selection-add",
+    rehearse_runtime_sbx_tampered => "runtime-sbx-tampered",
+    rehearse_runtime_sbx_cli_changed => "runtime-sbx-cli-changed",
+    rehearse_runtime_apple_missing_test => "runtime-apple-missing-test",
+    rehearse_runtime_docker_blocked => "runtime-docker-blocked",
+    rehearse_runtime_docker_tampered => "runtime-docker-tampered",
 }
 
 #[test]

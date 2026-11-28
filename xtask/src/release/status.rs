@@ -75,6 +75,10 @@ pub fn render(j: &Journal, w: Option<&World>, receipt: Result<(), String>) -> St
         &j.commit[..12],
         j.generation
     );
+    s.push_str(&format!(
+        "  KVM/Docker host: {}\n",
+        j.linux_host.as_deref().unwrap_or("not recorded")
+    ));
     for p in PHASES {
         let rec = j.phases.get(*p).cloned().unwrap_or_default();
         let status = match rec.status {
@@ -112,8 +116,28 @@ pub fn render(j: &Journal, w: Option<&World>, receipt: Result<(), String>) -> St
         )),
         Err(_) => {}
     }
+    for id in [
+        crate::manifest::release_policy::APPLE_NATIVE,
+        crate::manifest::release_policy::DOCKER_NATIVE,
+    ] {
+        if !j.native.contains_key(id) {
+            let status = match j.phases.get("native").map(|p| p.status) {
+                Some(Status::Running) => "RUNNING",
+                Some(Status::Blocked) => "BLOCKED",
+                Some(Status::Failed) => "FAILED",
+                _ => "PENDING",
+            };
+            s.push_str(&format!(
+                "  {id}: {status} (no complete verified result yet)\n"
+            ));
+        }
+    }
     for (id, n) in &j.native {
-        s.push_str(&format!("  {id:<20} {}", n.outcome));
+        s.push_str(&format!(
+            "  {id:<20} {} {}",
+            n.outcome.to_uppercase(),
+            n.reason.as_deref().unwrap_or("")
+        ));
         if let Some(q) = &n.sbx {
             s.push_str(&format!(
                 " (sbx {}, operator label {})",
@@ -121,6 +145,42 @@ pub fn render(j: &Journal, w: Option<&World>, receipt: Result<(), String>) -> St
                 q["operator_label"].as_str().unwrap_or("?")
             ));
         }
+        if let Some(service) = &n.service {
+            s.push_str(&format!(
+                " (service {}, CLI {}, version {}, digest {})",
+                service["kind"].as_str().unwrap_or("?"),
+                service["cli_path"].as_str().unwrap_or("?"),
+                service["server_version"]
+                    .as_str()
+                    .or_else(|| service["service_version"].as_str())
+                    .unwrap_or("?"),
+                service["cli_sha256"].as_str().unwrap_or("?")
+            ));
+        }
+        s.push('\n');
+    }
+    if let Some(selection) = &j.sbx_selection {
+        for h in &selection.hosts {
+            let r = j.sbx_smoke.get(&h.id);
+            s.push_str(&format!(
+                "  {} on {}: {} {}\n",
+                h.id,
+                h.destination.as_deref().unwrap_or("this Mac"),
+                r.map(|r| r.outcome.to_uppercase()).unwrap_or_else(|| {
+                    match j.phases.get("native").map(|p| p.status) {
+                        Some(Status::Running) => "RUNNING".into(),
+                        Some(Status::Blocked) => "BLOCKED".into(),
+                        Some(Status::Failed) => "FAILED".into(),
+                        _ => "PENDING".into(),
+                    }
+                }),
+                r.and_then(|r| r.reason.as_deref()).unwrap_or("")
+            ));
+        }
+        if !selection.hosts.iter().any(|h| h.host == "ssh") {
+            s.push_str("  sbx.linux-x64: NOT SELECTED (LINUX_HOST was not explicit)\n");
+        }
+        s.push_str(super::runtime_smoke::sbx::LIMITS);
         s.push('\n');
     }
     let active: f64 = j.invocations.iter().map(|i| i.monotonic_seconds).sum();

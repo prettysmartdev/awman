@@ -3,9 +3,12 @@
 //! 300 s. This binary must not `use awman` (hygiene rule H9): it links
 //! neither the library nor the VM stack.
 //!
-//! The module list is final.
+//! Native runtime modules select only their reviewed host-specific session.
 
 mod support;
+
+mod apple_smoke;
+mod docker_smoke;
 
 mod deps_scan;
 mod entrypoints;

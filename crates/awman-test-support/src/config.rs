@@ -246,7 +246,7 @@ allowed_capabilities = ["docker", "apple-containers", "previous-release", "local
 [tiers.artifact]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]
-allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network"]
+allowed_capabilities = ["hypervisor", "guest-fixtures", "previous-release", "offline", "docker-sbx", "sbx-test-identity", "public-network", "docker", "apple-containers"]
 [tiers.soak]
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary"]
 allowed_capabilities = ["docker", "hypervisor", "guest-fixtures", "public-network", "registry-credentials"]

@@ -11,6 +11,13 @@ Coverage is assessed by important behavior and risk, as described in
 historical tests. Do not reconstruct the deleted pre-WI144 CSV inventory or use
 its counts as an acceptance threshold. The Git history preserves that history.
 
+Some registered suites belong to no gate cell because only a real host can run
+them. `artifact-apple-smoke` and `artifact-docker-smoke` are release-critical
+and run through `make release` native kits; `artifact-sbx-smoke` is the optional
+provider diagnostic. The release SBX smoke is declared in the manifest's
+`[release.sbx_smoke.*]` table rather than as a suite. See
+[testing.md](testing.md#required-release-checks).
+
 For a new behavior, update its contract test and manifest suite. For a new
 runtime or platform, update the manifest and acceptance matrix, then obtain
 execution evidence on that platform. A source-level coverage row alone is not

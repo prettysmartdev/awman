@@ -9,5 +9,11 @@
   "artifact.access-reduction": [
     "awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation",
     "awman-cli::artifact switches::test_isolation_only_reduces_access"
+  ],
+  "artifact.apple-container-session": [
+    "awman-cli::artifact apple_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"
+  ],
+  "artifact.docker-container-session": [
+    "awman-cli::artifact docker_smoke::exact_asset_runs_a_synthetic_session_in_an_owned_container"
   ]
 }
