@@ -98,6 +98,9 @@ exec sh -c "$remote"
 /// A fake agent: if anything ran it on the host, the marker would appear.
 const FAKE_CLAUDE: &str = "#!/bin/sh\ntouch '@STATE@/claude-ran'\n";
 
+const FAKE_X64_UNAME: &str =
+    "#!/bin/sh\nif test \"$1\" = -m; then printf 'x86_64\\n'; else exec /usr/bin/uname \"$@\"; fi\n";
+
 struct Fixture {
     s: TestSandbox,
     state: PathBuf,
@@ -909,6 +912,28 @@ fn local_probe_classifies_missing_old_and_signed_out_cli() {
 }
 
 // ───────────────────────────── Linux over SSH ─────────────────────────────
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_x64_architecture_reaches_the_remote_lifecycle() {
+    let mut f = fixture(
+        "sbx_validation::release::tests::linux_x64_architecture_reaches_the_remote_lifecycle",
+    );
+    let bin = f.s.bin();
+    install(&mut f.s, "uname", &bin, FAKE_X64_UNAME);
+    let mut job = f.linux("x64-architecture");
+    job.binding.triple = "x86_64-unknown-linux-gnu".into();
+    let report = run(&job).unwrap();
+    assert_eq!(
+        reason(&report),
+        (Outcome::Passed, ""),
+        "{}",
+        linux_failure_details(&job, &report)
+    );
+    assert_eq!(report.host.get("arch").map(String::as_str), Some("x86_64"));
+    assert!(f.sandboxes().is_empty());
+    f.finish();
+}
 
 #[cfg(target_os = "linux")]
 #[test]

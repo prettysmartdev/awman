@@ -148,7 +148,11 @@ esac
 test $# -eq 12 || { printf 'wrong argument count\n' >&2; exit 2; }
 name=$2; nonce=$3; root=$4; asset_sha=$5; agent=$6; ready_sandbox=$7; want_arch=$8
 min=$9; ready_secs=${10}; step_secs=${11}; create_secs=${12}
-for value in "$name" "$nonce" "$asset_sha" "$agent" "$ready_sandbox" "$want_arch"; do safe "$value"; done
+for value in "$name" "$nonce" "$asset_sha" "$agent" "$ready_sandbox"; do safe "$value"; done
+case "$want_arch" in
+    x86_64 | aarch64) ;;
+    *) printf 'invalid architecture\n' >&2; exit 2 ;;
+esac
 semver "$min"; num "$ready_secs"; num "$step_secs"; num "$create_secs"
 owned_path "$root" "$name"
 need uname sha256sum base64 timeout git sed cat cmp setsid awk tr
