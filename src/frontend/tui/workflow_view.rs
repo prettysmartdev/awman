@@ -734,7 +734,17 @@ fn step_box_label_and_style(
         name.to_string()
     };
 
-    let (glyph, mut style) = match status {
+    let (glyph, mut style) = step_status_glyph_and_style(status);
+    if is_current {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let label = format!(" {glyph} {truncated_name} ");
+    (label, style)
+}
+
+/// Shared status glyph and color for workflow overview and historical DAGs.
+pub(crate) fn step_status_glyph_and_style(status: StepViewStatus) -> (&'static str, Style) {
+    match status {
         StepViewStatus::Pending => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
         StepViewStatus::Running => (
             "\u{25cf}",
@@ -756,10 +766,5 @@ fn step_box_label_and_style(
         StepViewStatus::Cancelled | StepViewStatus::Skipped => {
             ("\u{2298}", Style::default().fg(Color::DarkGray))
         }
-    };
-    if is_current {
-        style = style.add_modifier(Modifier::BOLD);
     }
-    let label = format!(" {glyph} {truncated_name} ");
-    (label, style)
 }

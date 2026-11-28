@@ -84,6 +84,7 @@ pub struct InstanceCommandFrontend {
     pub(crate) command_cancel: tokio_util::sync::CancellationToken,
     pub(crate) attach_lease: Option<crate::command::instance::feeds::AttachSessionLease>,
     pub(crate) attach_status: Arc<Mutex<Option<UserMessage>>>,
+    pub(crate) attach_daemon_reachable: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) parallel_group_active: bool,
     pub(crate) pending_step_slot_io:
         HashMap<String, crate::command::instance::feeds::ContainerSlotIo>,
@@ -246,6 +247,7 @@ impl InstanceCommandFrontend {
             attach_hangup: Default::default(),
             attach_lease: None,
             attach_status,
+            attach_daemon_reachable: None,
             parallel_group_active: false,
             pending_step_slot_io: HashMap::new(),
             pending_parallel_yolo_cancel: HashMap::new(),
@@ -283,7 +285,7 @@ impl InstanceCommandFrontend {
         self.container.launch(
             title,
             crate::command::instance::feeds::ContainerSlotIo {
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stdin_tx,
                 resize_tx,
             },
@@ -309,7 +311,7 @@ impl InstanceCommandFrontend {
         self.pending_step_slot_io.insert(
             step_name.to_string(),
             crate::command::instance::feeds::ContainerSlotIo {
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stdin_tx,
                 resize_tx,
             },

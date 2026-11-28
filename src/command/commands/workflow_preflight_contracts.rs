@@ -780,3 +780,34 @@ mod stale_images {
         s.finish();
     }
 }
+
+#[tokio::test]
+async fn an_importing_task_preparation_returns_the_kept_images_stale_warning() {
+    let s = TestSandbox::for_test(TestCase::component("command::commands::workflow_preflight::image_contracts::an_importing_task_preparation_returns_the_kept_images_stale_warning"));
+    let store = Arc::new(Store::default());
+    let tag = agent_image_tag(&s.work(), "claude");
+    let mut inner = Sink::default();
+    prepare_importing_step_with_recovery(
+        preparer(&s, store.clone(), true, local()),
+        &tag,
+        "claude",
+        &mut inner,
+        None,
+    )
+    .await
+    .unwrap();
+    // The refresh of an installed image fails: the old one is kept.
+    store.fail_build.store(true, Ordering::SeqCst);
+    let prep = preparer(&s, store.clone(), true, local());
+    std::fs::write(s.work().join("Dockerfile.dev"), "FROM scratch\nRUN false\n").unwrap();
+    let mut collecting = CollectStale {
+        sink: &mut inner,
+        warnings: Vec::new(),
+    };
+    prepare_importing_step_with_recovery(prep, &tag, "claude", &mut collecting, None)
+        .await
+        .unwrap();
+    assert_eq!(collecting.warnings.len(), 1, "the warning reaches the run");
+    assert_eq!(collecting.warnings[0].image, project_image_tag(&s.work()));
+    s.finish();
+}

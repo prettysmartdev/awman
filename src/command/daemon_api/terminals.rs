@@ -60,3 +60,13 @@ pub fn terminals_open(
 ) -> Result<TerminalSession, TerminalRefusal> {
     ops.open(id, viewer)
 }
+
+/// [`terminals_open`] with `?history=true` (WI 0105).
+pub fn terminals_open_with(
+    ops: &Arc<TerminalOperations>,
+    id: &TerminalId,
+    viewer: ViewerIdentity,
+    options: crate::engine::terminal_hub::SubscribeOptions,
+) -> Result<TerminalSession, TerminalRefusal> {
+    ops.open_with(id, viewer, options)
+}

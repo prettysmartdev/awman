@@ -35,24 +35,6 @@ pub fn service_label(value: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::service_label;
-
-    #[test]
-    fn status_labels_do_not_expose_paths_or_credentials() {
-        assert_eq!(service_label("Run tests"), "Run tests");
-        for value in [
-            "/private/tmp/job",
-            "token=abc123",
-            "secret value",
-            "line\nnext",
-        ] {
-            assert_eq!(service_label(value), "[redacted]");
-        }
-    }
-}
-
 pub struct Progress {
     phase: String,
     identity: String,
@@ -164,6 +146,24 @@ impl Drop for Progress {
                 self.identity,
                 self.started.elapsed().as_secs()
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_label;
+
+    #[test]
+    fn status_labels_do_not_expose_paths_or_credentials() {
+        assert_eq!(service_label("Run tests"), "Run tests");
+        for value in [
+            "/private/tmp/job",
+            "token=abc123",
+            "secret value",
+            "line\nnext",
+        ] {
+            assert_eq!(service_label(value), "[redacted]");
         }
     }
 }

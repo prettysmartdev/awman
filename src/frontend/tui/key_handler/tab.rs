@@ -155,6 +155,10 @@ pub(super) fn handle(app: &mut App, action: Action) {
 
         // ── Dialog actions ────────────────────────────────────────────
         Action::DetachContainers => {
+            if app.active_tab().is_squad {
+                crate::frontend::tui::squad_attach::detach_squad_attach(app);
+                return;
+            }
             if crate::frontend::tui::squad_attach::detach_squad_attach(app) {
                 return;
             }

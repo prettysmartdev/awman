@@ -383,6 +383,12 @@ pub struct ExecWorkflowCommand {
     /// ordinary `awman exec workflow`, which keeps its own per-invocation
     /// workflow context directory.
     task_workspace: Option<PathBuf>,
+    /// When set (only for a squad directory task, WI 0105), the root its
+    /// images were prepared from: the task-owned image context. Setup and
+    /// teardown containers use its project image instead of one derived from
+    /// the session root (the custom folder of a custom non-Git task). `None`
+    /// derives images from the session root as before.
+    image_root: Option<PathBuf>,
     /// Which workflow prerequisites apply to this run's root (WI 0088).
     /// `Repository` for an ordinary `awman exec workflow`; a squad task
     /// bound to a plain directory supplies its captured scope so Git/PR-only
@@ -424,6 +430,7 @@ impl ExecWorkflowCommand {
             session,
             squad_identity: None,
             task_workspace: None,
+            image_root: None,
             prerequisite_scope: Default::default(),
             workflow_state_root: None,
             managed_session: None,
@@ -558,6 +565,13 @@ impl ExecWorkflowCommand {
     /// container path serves the leader and every step.
     pub fn with_task_workspace(mut self, workspace: PathBuf) -> Self {
         self.task_workspace = Some(workspace);
+        self
+    }
+
+    /// The root this run's images were prepared from (WI 0105), used for
+    /// the setup/teardown phase image. Squad directory tasks only.
+    pub fn with_image_root(mut self, image_root: PathBuf) -> Self {
+        self.image_root = Some(image_root);
         self
     }
 

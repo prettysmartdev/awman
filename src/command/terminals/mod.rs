@@ -10,9 +10,14 @@
 
 mod operations;
 mod policy;
+mod replay;
 
 pub use operations::{
     AutomationRefusal, ClientFrameResponse, OperationReply, OwnerEventLog, OwnerResolver,
     TerminalAutomation, TerminalOperations, TerminalRefusal, TerminalSession,
 };
 pub use policy::{AccessPolicy, InputGrants};
+pub use replay::{
+    ReplayEffect, ReplayFeed, ReplayFilter, Unfiltered, EARLIER_OUTPUT_MARKER,
+    HISTORY_SNAPSHOT_RESET, LAGGED_MESSAGE, TRUNCATED_MESSAGE,
+};

@@ -2916,7 +2916,7 @@ mod workflow_dialog_contracts {
                 dialog_response_tx,
             },
             slot_io: ContainerSlotIo {
-                stdout_rx: tokio::sync::mpsc::unbounded_channel().1,
+                stdout_rx: tokio::sync::mpsc::unbounded_channel().1.into(),
                 stdin_tx: tokio::sync::mpsc::unbounded_channel().0,
                 resize_tx: tokio::sync::mpsc::unbounded_channel().0,
             },

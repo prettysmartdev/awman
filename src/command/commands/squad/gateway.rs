@@ -313,6 +313,27 @@ pub struct EnvPushResponse {
 
 #[async_trait]
 pub trait TaskGateway: Send + Sync {
+    /// Open a viewer on the same owner-only daemon transport as terminal
+    /// discovery. Kept on the gateway so commands and component fakes share
+    /// the transport boundary; input grants remain daemon-owned.
+    async fn open_terminal(
+        &self,
+        id: &crate::data::ids::TerminalId,
+        options: &crate::engine::remote::terminal_client::TerminalClientOptions,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<crate::engine::remote::terminal_client::TerminalStream, CommandError> {
+        let paths = crate::data::fs::DataPaths::from_env(env)?;
+        let endpoint = crate::engine::remote::local::discover(&paths.daemon())?
+            .ok_or(CommandError::DaemonNotRunning)?;
+        Ok(
+            crate::engine::remote::terminal_client::TerminalStream::connect_local(
+                &endpoint.address,
+                id,
+                options,
+            )
+            .await?,
+        )
+    }
     /// Allocate the run accepted by the resource API. Implementations without a scheduler refuse it.
     async fn create_run(&self, _name: &str) -> Result<RunId, CommandError> {
         Err(CommandError::Other("run creation unavailable".into()))
@@ -343,6 +364,17 @@ pub trait TaskGateway: Send + Sync {
     /// gateways implement the transport-specific lookup below.
     async fn workflow_state(&self, _task: &str) -> Result<Option<WorkflowState>, CommandError> {
         Ok(None)
+    }
+
+    /// Read the workflow projection saved for this exact task/run pair.
+    async fn run_workflow(
+        &self,
+        _task: &str,
+        _run: &RunId,
+    ) -> Result<crate::data::fs::RunWorkflow, CommandError> {
+        Err(CommandError::Other(
+            "run workflow lookup is unavailable".into(),
+        ))
     }
 
     /// Terminals owned by this exact run, never by the task's next run.
@@ -381,6 +413,14 @@ pub struct SharedTaskGateway(pub Arc<dyn TaskGateway>);
 
 #[async_trait]
 impl TaskGateway for SharedTaskGateway {
+    async fn open_terminal(
+        &self,
+        id: &crate::data::ids::TerminalId,
+        options: &crate::engine::remote::terminal_client::TerminalClientOptions,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<crate::engine::remote::terminal_client::TerminalStream, CommandError> {
+        self.0.open_terminal(id, options, env).await
+    }
     async fn create_run(&self, name: &str) -> Result<RunId, CommandError> {
         self.0.create_run(name).await
     }
@@ -420,6 +460,13 @@ impl TaskGateway for SharedTaskGateway {
     }
     async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
         self.0.workflow_state(task).await
+    }
+    async fn run_workflow(
+        &self,
+        task: &str,
+        run: &RunId,
+    ) -> Result<crate::data::fs::RunWorkflow, CommandError> {
+        self.0.run_workflow(task, run).await
     }
     async fn run_terminals(
         &self,
@@ -939,6 +986,7 @@ impl TaskGateway for LocalTaskGateway {
             last_run_at: None,
             trigger_requested_at: None,
             last_run_status: None,
+            last_run_phase: None,
             unmet_env: Vec::new(),
         };
         self.store.create(&task)?;
@@ -1217,6 +1265,29 @@ impl TaskGateway for LocalTaskGateway {
             return Ok(None);
         };
         Ok(crate::data::WorkflowStateStore::read_state_path(&path)?)
+    }
+
+    async fn run_workflow(
+        &self,
+        name: &str,
+        run_id: &RunId,
+    ) -> Result<crate::data::fs::RunWorkflow, CommandError> {
+        let Some(task) = self.store.get(name)? else {
+            return Err(CommandError::Other("run not found for task".into()));
+        };
+        // Scope lookup to the requested task. Never use the current run or a
+        // path supplied by the HTTP caller.
+        let run = self
+            .store
+            .runs_for(&task.name, usize::MAX)?
+            .into_iter()
+            .find(|run| &run.id == run_id)
+            .ok_or_else(|| CommandError::Other("run not found for task".into()))?;
+        tokio::task::spawn_blocking(move || crate::data::fs::project_run_workflow(&run))
+            .await
+            .map_err(|error| {
+                CommandError::Other(format!("run workflow projection failed: {error}"))
+            })
     }
 
     async fn run_terminals(

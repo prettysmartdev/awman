@@ -221,7 +221,7 @@ async fn attaching_stuck_events_preserves_workflow_requests_and_parallel_backbon
             launch_id,
             title: Some("initial step".into()),
             io: ContainerSlotIo {
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stdin_tx,
                 resize_tx,
             },
@@ -256,7 +256,7 @@ async fn attaching_stuck_events_preserves_workflow_requests_and_parallel_backbon
             launch_id: uuid::Uuid::new_v4(),
             title: Some("next step".into()),
             io: ContainerSlotIo {
-                stdout_rx,
+                stdout_rx: stdout_rx.into(),
                 stdin_tx,
                 resize_tx,
             },

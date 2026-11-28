@@ -199,7 +199,12 @@ impl App {
     /// tab's slots: the tab then behaves as an ordinary container tab.
     pub fn squad_grid_active(&self) -> bool {
         let tab = self.active_tab();
-        tab.is_squad && tab.container_slots.is_empty()
+        tab.is_squad
+            && tab.container_slots.is_empty()
+            && tab
+                .squad
+                .as_ref()
+                .is_none_or(|state| state.attach_view.is_none())
     }
 
     /// Keep `focus` consistent with the active tab (WI 0112), once per tick:
@@ -471,6 +476,27 @@ impl App {
         }
 
         self.clear_active_tab_for_new_command();
+        let terminal_attach = self.catalogue.is_terminal_attach(&parsed.path);
+        let label = parsed
+            .args
+            .argument("name")
+            .or_else(|| parsed.args.argument("id"))
+            .unwrap_or_else(|| parsed.path.join(" "));
+        let tab = self.active_tab_mut();
+        if let Some(state) = tab.squad.as_mut() {
+            state.end_attach();
+            state.attach_view = None;
+            if terminal_attach {
+                let generation = state
+                    .attach_session
+                    .begin_command(&label, tab.shared.command_cancel.clone());
+                state.attach_view =
+                    Some(crate::frontend::tui::tabs::squad_state::SquadAttachView {
+                        generation,
+                        task: label,
+                    });
+            }
+        }
         let tab = self.active_tab();
         let initial_size = initial_pty_size(terminal_size(), tab.git_sidebar_state);
         let squad_attach =
@@ -479,6 +505,7 @@ impl App {
                 .map(|state| crate::command::instance::feeds::SharedSquadAttach {
                     session: state.attach_session.clone(),
                     daemon_reachable: state.daemon_reachable.clone(),
+                    generation: state.attach_view.as_ref().map(|view| view.generation),
                 });
         let request = SubmitRequest {
             lease_id,
@@ -491,6 +518,12 @@ impl App {
         let submitted = match self.backend.submit(request) {
             Ok(submitted) => submitted,
             Err(error) => {
+                let tab = self.active_tab_mut();
+                if let Some(state) = tab.squad.as_mut() {
+                    if let Some(view) = state.attach_view.take() {
+                        state.attach_session.end_if_current(view.generation);
+                    }
+                }
                 self.status_bar.text = error.to_string();
                 return;
             }
@@ -900,10 +933,10 @@ impl App {
         if matches!(self.active_dialog, Some(Dialog::SquadTaskHistory(_))) {
             let polled = self.tabs[active].squad.as_ref().and_then(|state| {
                 let selected = state.selected_name()?;
-                let runs = state.snapshot.lock().ok().map(|g| g.runs.clone())?;
-                Some((selected, runs))
+                let snapshot = state.snapshot.lock().ok().map(|g| g.clone())?;
+                Some((selected, snapshot.runs, snapshot.run_workflow))
             });
-            if let (Some(Dialog::SquadTaskHistory(history)), Some((selected, runs))) =
+            if let (Some(Dialog::SquadTaskHistory(history)), Some((selected, runs, workflow))) =
                 (&mut self.active_dialog, polled)
             {
                 if selected == history.name {
@@ -913,6 +946,22 @@ impl App {
                     if let Some(detail) = history.run_detail.as_mut() {
                         if let Some(run) = runs.iter().find(|r| r.id == detail.run.id) {
                             detail.run = run.clone();
+                        }
+                        if let Some((run_id, result)) = workflow {
+                            if run_id == detail.run.id {
+                                detail.workflow = match result {
+                                    Ok(workflow) => {
+                                        crate::frontend::tui::dialogs::RunWorkflowLoad::Loaded(
+                                            workflow,
+                                        )
+                                    }
+                                    Err(error) => {
+                                        crate::frontend::tui::dialogs::RunWorkflowLoad::Failed(
+                                            error,
+                                        )
+                                    }
+                                };
+                            }
                         }
                     }
                     history.runs = runs;
@@ -927,13 +976,13 @@ impl App {
         // unreachable, surface the frozen-overview indicator (the attached
         // container slots keep streaming from their direct runtime connections).
         if let Some(state) = self.tabs[active].squad.as_ref() {
-            if state.attached_task().is_some()
+            if state.attach_view.is_some()
                 && !state
                     .daemon_reachable
                     .load(std::sync::atomic::Ordering::Relaxed)
             {
                 self.status_bar.text =
-                    "squad daemon not reachable — workflow overview frozen; attached containers still live"
+                    "squad daemon not reachable — view frozen; Ctrl-\\ returns to the grid"
                         .to_string();
             }
         }

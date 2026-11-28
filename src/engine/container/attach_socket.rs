@@ -275,7 +275,7 @@ mod unix_impl {
                         let (tag, bytes, exited) = match frame {
                             Some(TerminalFrame::Snapshot { screen, .. } | TerminalFrame::Output { bytes: screen }) => (Tag::Output, screen, false),
                             Some(TerminalFrame::Exit { code }) => (Tag::Exit, code.to_le_bytes().to_vec(), true),
-                            Some(TerminalFrame::Error { .. } | TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. }) => continue,
+                            Some(TerminalFrame::Error { .. } | TerminalFrame::History { .. } | TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. }) => continue,
                             None => return,
                         };
                         if write_frame_bounded(&mut writer, tag, &bytes, WRITE_TIMEOUT).await.is_err() || exited { return; }

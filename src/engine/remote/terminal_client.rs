@@ -29,6 +29,10 @@ pub struct TerminalClientOptions {
     pub annotations: Annotations,
     /// `x-awman-actor` for network clients; `None` on the local socket.
     pub actor: Option<String>,
+    /// `?history=true`: replay retained output before the first snapshot
+    /// (WI 0105). Only a viewer with a fresh emulator should ask, so replay
+    /// never duplicates scrollback it already shows.
+    pub history: bool,
 }
 
 /// One open terminal socket.
@@ -53,10 +57,7 @@ impl TerminalStream {
         let stream = connect_local_stream(endpoint).await?;
         let mut request = Request::builder()
             .method("GET")
-            .uri(format!(
-                "ws://localhost/v1/terminals/{id}?read_only={}",
-                options.read_only
-            ))
+            .uri(terminal_uri(id, options))
             .header("host", "localhost")
             .header("connection", "Upgrade")
             .header("upgrade", "websocket")
@@ -192,6 +193,19 @@ pub(super) async fn connect_local_stream(
         .open(endpoint)
         .map(|stream| Box::new(stream) as Box<dyn LocalStream>)
         .map_err(|error| failure(error.to_string()))
+}
+
+/// The upgrade URI. `history` is sent only when asked, so a request
+/// without it is byte-identical to the pre-history client.
+fn terminal_uri(id: &TerminalId, options: &TerminalClientOptions) -> String {
+    let mut uri = format!(
+        "ws://localhost/v1/terminals/{id}?read_only={}",
+        options.read_only
+    );
+    if options.history {
+        uri.push_str("&history=true");
+    }
+    uri
 }
 
 fn failure(message: String) -> EngineError {

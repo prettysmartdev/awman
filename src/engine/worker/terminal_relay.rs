@@ -296,7 +296,9 @@ pub fn wire_frame(frame: TerminalFrame) -> Option<WireFrame> {
         TerminalFrame::Resize { cols, rows } => WireFrame::Resize { cols, rows },
         TerminalFrame::Exit { code } => WireFrame::Exit { code: Some(code) },
         TerminalFrame::Lagged => WireFrame::Lagged,
-        TerminalFrame::AutomationState { .. }
+        // The relay subscribes without history; it never sees one.
+        TerminalFrame::History { .. }
+        | TerminalFrame::AutomationState { .. }
         | TerminalFrame::TurnAccepted { .. }
         | TerminalFrame::TurnResult { .. }
         | TerminalFrame::ExecutionClosed { .. }

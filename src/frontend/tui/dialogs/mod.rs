@@ -218,6 +218,16 @@ pub struct SquadRunDetailState {
     pub run: crate::data::fs::task_store::Run,
     pub scroll: usize,
     pub max_scroll: std::cell::Cell<usize>,
+    pub workflow: RunWorkflowLoad,
+    pub hscroll: usize,
+    pub max_hscroll: std::cell::Cell<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RunWorkflowLoad {
+    Loading,
+    Loaded(crate::data::fs::RunWorkflow),
+    Failed(String),
 }
 
 pub struct ConfigShowState {

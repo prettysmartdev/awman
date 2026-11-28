@@ -827,6 +827,7 @@ mod contracts {
             platform: OciPlatform::host_linux(),
             build_args: vec![],
             no_cache: false,
+            cancel: Default::default(),
         };
         for error in [
             builder.probe(&target, &control).unwrap_err(),
@@ -1041,6 +1042,7 @@ mod contracts {
             platform: OciPlatform::host_linux(),
             build_args: vec![],
             no_cache: false,
+            cancel: Default::default(),
         };
         let mut completion = Completion::default();
         prep.build_source(request, resolved.docker_endpoint.as_ref(), &mut completion)
@@ -1230,6 +1232,7 @@ mod contracts {
                 platform: OciPlatform::host_linux(),
                 build_args: vec![],
                 no_cache: false,
+                cancel: Default::default(),
             };
             let mut lines = vec![];
             let error = builder

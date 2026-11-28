@@ -6,7 +6,7 @@
 
 use super::*;
 
-use crate::data::fs::task_store::{RunStatus, Task, TaskStatus};
+use crate::data::fs::task_store::{RunPhase, RunStatus, Task, TaskStatus};
 use crate::frontend::tui::tabs::squad_state::SquadSnapshot;
 
 /// Minimum card size, in cells, per WI 0106 Part 5 ("generous size and
@@ -269,6 +269,9 @@ pub(crate) enum CardStatus {
     Paused,
     /// The most recent run is still going.
     Running,
+    /// The most recent run is still going and is building a container image
+    /// (WI 0105). Ranks exactly where [`Running`](Self::Running) does.
+    Building,
     /// A `squad trigger` is waiting to be honoured on the next tick.
     Triggered,
     /// The most recent run ended `failed`.
@@ -284,6 +287,7 @@ impl CardStatus {
         match self {
             Self::Paused => Color::DarkGray,
             Self::Running => Color::Blue,
+            Self::Building => Color::Cyan,
             Self::Triggered => Color::Magenta,
             Self::Failed => Color::Red,
             Self::NeverRun => Color::Yellow,
@@ -303,7 +307,10 @@ pub(crate) fn card_status(task: &Task) -> CardStatus {
         return CardStatus::Paused;
     }
     if task.last_run_status == Some(RunStatus::Running) {
-        return CardStatus::Running;
+        return match task.last_run_phase {
+            Some(RunPhase::Building) => CardStatus::Building,
+            None => CardStatus::Running,
+        };
     }
     if task.trigger_requested_at.is_some() {
         return CardStatus::Triggered;
@@ -441,13 +448,25 @@ fn labelled_card_line<'a>(label: &str, value: &str, width: u16) -> Line<'a> {
 /// separately; a task that has never run reads `never run`.
 fn last_run_outcome(task: &Task) -> &'static str {
     match task.last_run_status {
-        Some(RunStatus::Running) => "running",
-        Some(RunStatus::NotTriggered) => "not triggered",
-        Some(RunStatus::WorkflowExecuted) => "workflow executed",
-        Some(RunStatus::Failed) => "failed",
-        Some(RunStatus::Interrupted) => "interrupted",
-        Some(RunStatus::Canceled) => "canceled",
+        Some(status) => run_status_label(status, task.last_run_phase),
         None => "never run",
+    }
+}
+
+/// What a run is shown as: its status, refined by its phase while it is still
+/// running. A phase left beside a finished status is ignored, so a final
+/// outcome is never hidden.
+pub(crate) fn run_status_label(status: RunStatus, phase: Option<RunPhase>) -> &'static str {
+    match status {
+        RunStatus::Running => match phase {
+            Some(RunPhase::Building) => "building",
+            None => "running",
+        },
+        RunStatus::NotTriggered => "not triggered",
+        RunStatus::WorkflowExecuted => "workflow executed",
+        RunStatus::Failed => "failed",
+        RunStatus::Interrupted => "interrupted",
+        RunStatus::Canceled => "canceled",
     }
 }
 
@@ -515,3 +534,6 @@ fn next_evaluation(task: &Task) -> String {
     }
     format_time(next)
 }
+
+#[cfg(test)]
+mod phase_tests;

@@ -48,6 +48,15 @@ impl Tab {
             Ok(mut q) => q.drain(..).collect(),
             Err(_) => return,
         };
+        if self.is_squad
+            && self
+                .squad
+                .as_ref()
+                .is_none_or(|state| state.attach_view.is_none())
+        {
+            self.shared.workflow.update_view(|view| *view = None);
+            return;
+        }
         for event in events {
             self.apply_container_slot_event(event);
         }
@@ -310,7 +319,7 @@ impl Tab {
                 continue;
             };
             while let Ok(bytes) = rx.try_recv() {
-                let filtered = strip_alternate_screen_sequences(&bytes);
+                let filtered = slot.alt_stripper.strip(&bytes);
                 if let Some(on) = filtered.alt_screen {
                     slot.agent_alt_screen = on;
                 }
@@ -451,5 +460,14 @@ impl Tab {
         self.shared.detach();
         self.engine_tx = None;
         self.last_workflow_invocation_id = None;
+        self.workflow_overview_scroll_offset = 0;
+        self.workflow_overview_hscroll_offset = 0;
+        self.workflow_overview_hscroll_follow = true;
+        self.workflow_overview_state = WorkflowOverviewState::Minimized;
+        self.last_overview_rect = None;
+        self.last_overview_hlayout = None;
+        self.mouse_selection = None;
+        self.container_scroll_offset = 0;
+        self.container_inner_area = None;
     }
 }

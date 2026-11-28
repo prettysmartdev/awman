@@ -121,16 +121,36 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
 /// Open the detail modal for the run-history row that is selected. A no-op
 /// when the history is empty or a run's detail is already open.
 fn open_squad_run_detail(app: &mut App) {
-    if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
+    let request = if let Some(Dialog::SquadTaskHistory(state)) = &mut app.active_dialog {
         if state.run_detail.is_some() {
             return;
         }
-        if let Some(run) = state.runs.get(state.selected) {
+        state.runs.get(state.selected).map(|run| {
             state.run_detail = Some(dialogs::SquadRunDetailState {
                 run: run.clone(),
                 scroll: 0,
                 max_scroll: std::cell::Cell::new(0),
+                workflow: dialogs::RunWorkflowLoad::Loading,
+                hscroll: 0,
+                max_hscroll: std::cell::Cell::new(0),
             });
+            (state.name.clone(), run.id.clone())
+        })
+    } else {
+        None
+    };
+    if let Some((task, run)) = request {
+        if let Some(squad) = app.active_tab_mut().squad.as_mut() {
+            // Drop any cached result so a stale error (or another run's graph)
+            // is never shown for the detail that is opening; the poller
+            // fetches it afresh.
+            if let Ok(mut snapshot) = squad.snapshot.lock() {
+                snapshot.run_workflow = None;
+            }
+            if let Ok(mut request) = squad.run_workflow_request.lock() {
+                *request = Some((task, run));
+                squad.poll_wake.notify_one();
+            }
         }
     }
 }

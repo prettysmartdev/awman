@@ -36,6 +36,44 @@ pub const FLAG_STEP: &str = "step";
 pub const FLAG_READ_ONLY: &str = "read-only";
 pub const FLAG_ANNOTATION: &str = "annotation";
 
+mod follow;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachViewState {
+    Resolving,
+    WaitingForTerminal,
+    Live,
+    BetweenTerminals,
+    WorkflowStateMissing,
+    DaemonUnreachable,
+    Ended(super::squad::attach::TaskAttachEnd),
+}
+
+impl AttachViewState {
+    pub fn message(&self) -> String {
+        match self {
+            Self::Resolving | Self::WaitingForTerminal => {
+                super::squad::attach::WAITING_FOR_TERMINAL.into()
+            }
+            Self::Live => "Following this run — Ctrl-\\ detaches.".into(),
+            Self::BetweenTerminals => "Waiting for the next agent terminal…".into(),
+            Self::WorkflowStateMissing => {
+                "No workflow state for this run yet. Waiting for the next agent terminal…".into()
+            }
+            Self::DaemonUnreachable => {
+                "squad daemon not reachable — view frozen; Ctrl-\\ detaches".into()
+            }
+            Self::Ended(end) => end.message(Default::default()),
+        }
+    }
+}
+
+pub struct AttachSlot {
+    pub step_name: String,
+    pub agent: String,
+    pub container: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachOutcome {
     pub terminal_id: Option<TerminalId>,
@@ -51,6 +89,31 @@ pub struct AttachOutcome {
 /// Presentation only — the filter policy and grant rules are the command's.
 #[async_trait]
 pub trait AttachCommandFrontend: UserMessageSink + Send {
+    fn follows_run(&self) -> bool {
+        false
+    }
+
+    fn attach_view_state(&mut self, state: AttachViewState) {
+        self.attach_status(crate::data::message::UserMessage {
+            level: crate::data::message::MessageLevel::Info,
+            text: state.message(),
+        });
+    }
+
+    fn publish_workflow(&mut self, _state: &crate::data::workflow_state::WorkflowState) {}
+
+    fn remove_terminal_slot(&mut self, _step_name: &str) {}
+
+    fn bind_terminal_slot(
+        &mut self,
+        _slot: AttachSlot,
+        stream: TerminalStream,
+        read_only: bool,
+        policy: HostOutputPolicy,
+        _cancel: CancellationToken,
+    ) -> Result<tokio::task::JoinHandle<()>, CommandError> {
+        self.bind_terminal(stream, read_only, policy)
+    }
     /// Start the attach session. The returned token ends it on Ctrl-C (a
     /// `user` detach); the TUI cancels it when the tab closes.
     fn begin_attach(&mut self, terminal_id: &TerminalId) -> CancellationToken;
@@ -204,6 +267,10 @@ impl Command for AttachCommand {
         let cancel = frontend.begin_resolve(&label);
         let result = async {
             validate_step_target(&self.target, self.step())?;
+            if matches!(self.target, AttachTarget::Task(_)) && frontend.follows_run() {
+                let gateway = self.gateway().await?;
+                return self.follow_task(gateway, frontend.as_mut(), &cancel).await;
+            }
             let paths = DataPaths::from_env(&self.env)?;
             let endpoint = discover(&paths.daemon())?.ok_or(CommandError::DaemonNotRunning)?;
             let terminal_id = match &self.target {
@@ -267,6 +334,8 @@ impl Command for AttachCommand {
                 annotations: self.annotations.clone(),
                 actor: None,
                 read_only: self.read_only,
+                // A new attach always starts a fresh viewer: replay history.
+                history: true,
             };
             let connect = TerminalStream::connect_local(&endpoint.address, &terminal_id, &options);
             let stream = tokio::select! {

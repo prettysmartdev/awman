@@ -24,6 +24,38 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
     let tab = app.active_tab();
     let workflow_active = tab.shared.workflow.snapshot().view.is_some();
 
+    if tab
+        .squad
+        .as_ref()
+        .is_some_and(|state| state.attach_view.is_some())
+        && !matches!(tab.execution_phase, ExecutionPhase::Error { .. })
+    {
+        // The daemon relay mirrors status messages but not attach_status.
+        // Both backends therefore expose the same explicit attach states.
+        let message = tab
+            .shared
+            .attach_status
+            .lock()
+            .ok()
+            .and_then(|status| status.clone())
+            .map(|message| message.text)
+            .or_else(|| {
+                tab.shared
+                    .status_log
+                    .lock()
+                    .ok()?
+                    .last()
+                    .map(|line| line.text.clone())
+            });
+        if let Some(message) = message {
+            frame.render_widget(
+                Paragraph::new(message).style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                area,
+            );
+            return;
+        }
+    }
+
     // A squad tab renders the card grid in place of the execution window, so
     // the execution-window hints below ("Exit code", "press ↑ to focus the
     // window") describe something that is not on screen. What is worth saying

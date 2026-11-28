@@ -48,7 +48,7 @@ pub(super) fn focus_context(app: &App) -> FocusContext {
         // actively running.  Once the command finishes the overlay is closed, but
         // guard here too so a race can't leave the user unable to type.
         FocusContext::ContainerMaximized
-    } else if app.active_tab().is_squad && app.active_tab().container_slots.is_empty() {
+    } else if app.squad_grid_active() {
         // WI 0102: the squad task list holds focus. While an attach session
         // owns the tab's slots (`container_slots` non-empty) this falls through
         // to the ordinary ContainerMaximized/ExecutionWindow handling, so
@@ -74,6 +74,23 @@ pub(super) fn focus_context(app: &App) -> FocusContext {
 /// keymap because they depend on *which* dialog is open, which the keymap's
 /// `FocusContext::Dialog` does not distinguish.
 fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    if matches!(app.active_dialog, Some(Dialog::SquadTaskHistory(_))) {
+        if let Some(Dialog::SquadTaskHistory(history)) = &mut app.active_dialog {
+            if let Some(detail) = history.run_detail.as_mut() {
+                match key.code {
+                    KeyCode::Left => {
+                        detail.hscroll = detail.hscroll.saturating_sub(8);
+                        return true;
+                    }
+                    KeyCode::Right => {
+                        detail.hscroll = (detail.hscroll + 8).min(detail.max_hscroll.get());
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     // The work-queue panel and the lease close prompt own every key.
     if matches!(app.active_dialog, Some(Dialog::QueuePanel(_))) {
         queue::handle_panel_key(app, key);

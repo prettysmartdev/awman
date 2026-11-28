@@ -1187,6 +1187,16 @@ async fn builtin_local_builders_use_the_project_tag_for_agent_images() {
             )
             .await
             .unwrap();
+        if cfg!(windows) && matches!(source, ImageSourceSpec::DockerStore { .. }) {
+            assert!(matches!(
+                result.build,
+                StepStatus::Failed(ref reason)
+                    if reason.contains("must name an absolute socket path")
+            ));
+            assert!(store.source_build_recipes.lock().unwrap().is_empty());
+            s.finish();
+            continue;
+        }
         assert_eq!(result.build, StepStatus::Done, "{source:?}");
         let recipes = store.source_build_recipes.lock().unwrap();
         assert_eq!(recipes.len(), 2, "{source:?}");

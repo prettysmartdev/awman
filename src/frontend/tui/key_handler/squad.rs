@@ -117,11 +117,23 @@ pub(super) fn handle(app: &mut App, action: Action) {
         // stays on `Action::ScrollUp`/`ScrollDown` above — only Left/Right are
         // grid-new.
         Action::SquadMoveLeft => {
+            if let Some(Dialog::SquadTaskHistory(history)) = &mut app.active_dialog {
+                if let Some(detail) = history.run_detail.as_mut() {
+                    detail.hscroll = detail.hscroll.saturating_sub(8);
+                    return;
+                }
+            }
             if let Some(state) = app.active_tab_mut().squad.as_mut() {
                 state.move_selection_col(-1);
             }
         }
         Action::SquadMoveRight => {
+            if let Some(Dialog::SquadTaskHistory(history)) = &mut app.active_dialog {
+                if let Some(detail) = history.run_detail.as_mut() {
+                    detail.hscroll = (detail.hscroll + 8).min(detail.max_hscroll.get());
+                    return;
+                }
+            }
             if let Some(state) = app.active_tab_mut().squad.as_mut() {
                 state.move_selection_col(1);
             }

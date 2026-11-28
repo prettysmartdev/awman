@@ -60,6 +60,7 @@ fn task(name: &str, now: chrono::DateTime<Utc>, scope: std::path::PathBuf) -> Ta
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        last_run_phase: None,
         unmet_env: vec![],
         prerequisites: None,
     }
@@ -295,3 +296,4 @@ async fn concurrent_ticks_share_capacity_and_cancelled_evaluations_leave_no_runn
     assert!(status.cancellations.is_empty());
     drop(status);
 }
+mod build_phase;

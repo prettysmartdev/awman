@@ -172,7 +172,7 @@ async fn final_review_reopens_while_the_agent_output_stays_available() {
     container.launch(
         Some("final".into()),
         ContainerSlotIo {
-            stdout_rx,
+            stdout_rx: stdout_rx.into(),
             stdin_tx,
             resize_tx,
         },
@@ -705,6 +705,11 @@ async fn squad_detach_returns_grid_and_discards_late_events_and_completion() {
     let session = state.attach_session.clone();
     let cancel = app.active_tab().shared.command_cancel.clone();
     let generation = session.begin_command("squad attach task", cancel.clone());
+    app.active_tab_mut().squad.as_mut().unwrap().attach_view =
+        Some(tabs::squad_state::SquadAttachView {
+            generation,
+            task: "task".into(),
+        });
     let events = app.active_tab().shared.container.clone();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     {
@@ -771,6 +776,16 @@ async fn squad_waiting_and_timeout_are_visible_and_ctrl_c_drops_dialogs() {
     // Exercise the production instance producer, including synchronous submit
     // registration, before any daemon round trip has had a chance to finish.
     let tab = app.active_tab_mut();
+    let generation = tab
+        .squad
+        .as_ref()
+        .unwrap()
+        .attach_session
+        .begin_command("task", tab.shared.command_cancel.clone());
+    tab.squad.as_mut().unwrap().attach_view = Some(tabs::squad_state::SquadAttachView {
+        generation,
+        task: "task".into(),
+    });
     let parsed =
         Dispatch::<TuiCommandFrontend>::parse_command_box_input("squad attach task").unwrap();
     let (request_tx, request_rx) = std::sync::mpsc::channel();
@@ -793,6 +808,7 @@ async fn squad_waiting_and_timeout_are_visible_and_ctrl_c_drops_dialogs() {
     .with_squad_attach(Some(crate::command::instance::feeds::SharedSquadAttach {
         session: tab.squad.as_ref().unwrap().attach_session.clone(),
         daemon_reachable: tab.squad.as_ref().unwrap().daemon_reachable.clone(),
+        generation: Some(generation),
     }));
     let cancel = producer.begin_resolve("task");
     producer.attach_status(UserMessage {
@@ -804,9 +820,17 @@ async fn squad_waiting_and_timeout_are_visible_and_ctrl_c_drops_dialogs() {
         command: "squad attach task".into(),
         message: "daemon unavailable".into(),
     };
-    let frame = draw(&mut app, 140, 40);
-    assert!(frame.contains("daemon unavailable"));
-    assert!(!frame.contains("Waiting for agent terminal to start…"));
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+    terminal
+        .draw(|frame| render::render_frame(&mut app, frame))
+        .unwrap();
+    let status_line: String = (0..140)
+        .map(|x| terminal.backend().buffer()[(x, 35)].symbol())
+        .collect();
+    assert!(status_line.contains("daemon unavailable"));
+    // An active viewer now keeps the execution log on screen, including its
+    // earlier startup message. The current status must show the failure.
+    assert!(!status_line.contains("Waiting for agent terminal to start…"));
     app.active_tab_mut().execution_phase = tabs::ExecutionPhase::Idle;
     producer.terminal_ready();
     assert!(app
@@ -883,3 +907,5 @@ async fn squad_new_tab_cancel_opens_nothing_and_relative_confirm_uses_home() {
     drop(app);
     s.finish();
 }
+
+mod squad_follow;

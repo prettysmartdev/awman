@@ -189,6 +189,7 @@ fn task(name: &str, root: &Path, mount_scope: MountScope) -> Task {
         last_run_at: None,
         trigger_requested_at: None,
         last_run_status: None,
+        last_run_phase: None,
         unmet_env: vec![],
         prerequisites: None,
     }

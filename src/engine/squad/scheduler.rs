@@ -22,13 +22,16 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::data::config::{ConfigFile, EnvSnapshot, FileKind};
+use crate::data::fs::task_store::RunPhase;
 use crate::data::fs::SquadRunPaths;
 use crate::data::fs::{RunDetail, RunId, RunStatus, SquadPaths, Task, TaskStore};
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 use crate::engine::container::naming::parse_squad_task_slug;
 use crate::engine::squad::env_state::DaemonEnvState;
 
-use super::evaluator::{EvaluationOutcome, EvaluationRequest, RunProgress, TaskEvaluator};
+use super::evaluator::{
+    EvaluationOutcome, EvaluationRequest, ImagePreparationEvent, RunProgress, TaskEvaluator,
+};
 
 /// A leader's resolved identity for one task, as the Layer 2 evaluator
 /// reported it. The scheduler logs this instead of re-deriving it (F-46).
@@ -39,8 +42,10 @@ pub struct ResolvedLeader {
 }
 
 /// Records the live workflow-state path on the run row the moment the generated
-/// workflow starts, and the leader's resolved agent/model as soon as Layer 2
-/// has chosen it. The store stays the scheduler's to write.
+/// workflow starts, the leader's resolved agent/model as soon as Layer 2 has
+/// chosen it, and the run's image preparation: the `building` phase while an
+/// image is actually being built, and any stale-image warning. The store stays
+/// the scheduler's to write.
 struct StoreRunProgress {
     store: Arc<TaskStore>,
     resolved_leaders: Arc<Mutex<HashMap<String, ResolvedLeader>>>,
@@ -58,6 +63,32 @@ impl RunProgress for StoreRunProgress {
                 .set_workflow_state_path(run_id, Some(workflow_path), Some(state_path))
         {
             tracing::warn!("squad: failed to record workflow state path: {error}");
+        }
+    }
+
+    fn image_preparation(&self, run_id: &RunId, event: ImagePreparationEvent) {
+        // Reuse reports no `BuildStarted`, so it never enters the phase. A
+        // preparation with several builds stays in it until its one
+        // `PreparationFinished`, which also arrives on failure and
+        // cancellation. A bookkeeping failure never fails the run.
+        let recorded = match event {
+            ImagePreparationEvent::BuildStarted { .. } => self
+                .store
+                .set_run_phase(run_id, Some(RunPhase::Building))
+                .map(drop),
+            ImagePreparationEvent::PreparationFinished => {
+                self.store.set_run_phase(run_id, None).map(drop)
+            }
+            ImagePreparationEvent::Stale { image, reason } => self.store.set_run_image_warning(
+                run_id,
+                &format!("{image} is out of date; rebuild failed: {reason}"),
+            ),
+        };
+        if let Err(error) = recorded {
+            tracing::warn!(
+                run_id = %run_id,
+                "squad: failed to record image preparation: {error}"
+            );
         }
     }
 

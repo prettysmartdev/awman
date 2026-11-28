@@ -327,6 +327,45 @@ impl RemoteInstanceBackend {
             }
         }
     }
+
+    /// A detached Squad viewer's final frame is a relay barrier. Keep its
+    /// feeds installed until that barrier, before submitting a new viewer:
+    /// otherwise its late completion can be mistaken for the new submit's
+    /// refusal, and its workflow deltas can enter the new view.
+    fn finish_cancelled_squad_attach(&self, session_id: &SessionId) -> Result<(), CommandError> {
+        let (rx, cancel) = {
+            let mut state = self.shared.lock();
+            let Some(tab) = state
+                .tabs
+                .iter_mut()
+                .find(|tab| tab.session.id() == *session_id)
+            else {
+                return Ok(());
+            };
+            let Some(run) = tab.run.as_mut() else {
+                return Ok(());
+            };
+            if !run.squad_viewer || run.finished || !run.feeds.command_cancel.is_cancelled() {
+                return Ok(());
+            }
+            let (tx, rx) = std::sync::mpsc::channel();
+            run.finish_waiters.push(tx);
+            let cancel = if run.cancel_sent {
+                None
+            } else {
+                run.cancel_sent = true;
+                Some(FrontendFrame::Cancel {
+                    tab_id: tab.tab_id.clone(),
+                    repeat: false,
+                })
+            };
+            (rx, cancel)
+        };
+        if let Some(cancel) = cancel {
+            self.shared.send(cancel);
+        }
+        self.wait(rx, "previous Squad detach")
+    }
 }
 
 impl Drop for RemoteInstanceBackend {
@@ -475,7 +514,10 @@ struct RemoteRun {
     stuck: Option<tokio::sync::broadcast::Sender<StuckEvent>>,
     cancel_sent: bool,
     finished: bool,
+    finish_waiters: Vec<std::sync::mpsc::Sender<Result<(), CommandError>>>,
     submitted_at: Option<Instant>,
+    /// Submitted as a Squad viewer: only such a run is a reattach barrier.
+    squad_viewer: bool,
 }
 
 struct PendingSubmit {
@@ -505,7 +547,7 @@ struct RemoteSlot {
 }
 
 struct SlotOutput {
-    tx: UnboundedSender<Vec<u8>>,
+    tx: crate::command::instance::feeds::SlotOutputTx,
     active: bool,
 }
 
@@ -517,13 +559,13 @@ impl SlotOutput {
 
 /// The producer ends of one slot's `ContainerSlotIo`.
 struct SlotPipes {
-    stdout_tx: UnboundedSender<Vec<u8>>,
+    stdout_tx: crate::command::instance::feeds::SlotOutputTx,
     stdin_rx: UnboundedReceiver<Vec<u8>>,
     resize_rx: UnboundedReceiver<(u16, u16)>,
 }
 
 fn slot_channels() -> (ContainerSlotIo, SlotPipes) {
-    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdout_tx, stdout_rx) = crate::command::instance::feeds::slot_output_channel();
     let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
     let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel();
     (
@@ -564,6 +606,8 @@ fn new_run(feeds: TabCommandFeeds) -> (RemoteRun, TabFeeds, ContainerSlotIo) {
             stuck: None,
             cancel_sent: false,
             finished: false,
+            finish_waiters: Vec::new(),
+            squad_viewer: false,
             submitted_at: None,
         },
         TabFeeds {
@@ -804,6 +848,13 @@ impl InstanceBackend for RemoteInstanceBackend {
     }
 
     fn submit(&self, request: SubmitRequest) -> Result<SubmittedCommand, CommandError> {
+        if request
+            .squad_attach
+            .as_ref()
+            .is_some_and(|attach| attach.generation.is_some())
+        {
+            self.finish_cancelled_squad_attach(&request.session_id)?;
+        }
         let path: Vec<&str> = request.parsed.path.iter().map(String::as_str).collect();
         let spec = self
             .shared
@@ -818,6 +869,7 @@ impl InstanceBackend for RemoteInstanceBackend {
         };
         let (mut run, feeds, slot_io) = new_run(request.feeds.clone());
         run.submitted_at = Some(Instant::now());
+        run.squad_viewer = request.squad_attach.is_some();
         let (tx, rx) = std::sync::mpsc::channel();
         let tab_id = {
             let mut state = self.shared.lock();
@@ -955,6 +1007,9 @@ impl InstanceBackend for RemoteInstanceBackend {
             terminal_id.clone(),
             pipes,
             output,
+            // A host terminal has no tab status log; its lag notice is not
+            // shown (its screen still resynchronises from the snapshot).
+            Arc::new(Mutex::new(Vec::new())),
             self.shared.stop.child_token(),
         ));
         Ok(io)
@@ -1536,6 +1591,11 @@ fn wake_all(state: &mut State, loss: &BackendLoss) {
             .send(Err(CommandError::Other(loss.to_string())));
     }
     for tab in &mut state.tabs {
+        if let Some(run) = tab.run.as_mut() {
+            for waiter in run.finish_waiters.drain(..) {
+                let _ = waiter.send(Err(CommandError::Other(loss.to_string())));
+            }
+        }
         if let Some(pending) = tab.pending.take() {
             let _ = pending
                 .reply
@@ -1710,6 +1770,9 @@ fn handle_frame(shared: &Shared, state: &mut State, seq: Seq, frame: EngineFrame
             if let Some(run) = tab.run.as_mut() {
                 if !run.finished {
                     run.finished = true;
+                    for waiter in run.finish_waiters.drain(..) {
+                        let _ = waiter.send(Ok(()));
+                    }
                     let _ = run.command_result_tx.send(result_from_wire(&result));
                 }
             }
@@ -2366,6 +2429,7 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
             terminal_id,
             pipes,
             Arc::clone(&output),
+            run.feeds.status_log.clone(),
             token.clone(),
         ));
         token
@@ -2382,6 +2446,34 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
     );
 }
 
+/// Test seam: one presenter slot subscription exactly as `launch_slot` starts
+/// it, with its status log, for a terminal served at `address`.
+#[cfg(test)]
+pub(crate) fn spawn_slot_subscription(
+    address: PathBuf,
+    terminal_id: TerminalId,
+    cancel: CancellationToken,
+) -> (
+    ContainerSlotIo,
+    crate::command::instance::feeds::SharedStatusLog,
+) {
+    let (io, pipes) = slot_channels();
+    let output = Arc::new(Mutex::new(SlotOutput {
+        tx: pipes.stdout_tx.clone(),
+        active: true,
+    }));
+    let status_log: crate::command::instance::feeds::SharedStatusLog = Default::default();
+    tokio::spawn(subscribe_terminal(
+        address,
+        terminal_id,
+        pipes,
+        output,
+        status_log.clone(),
+        cancel,
+    ));
+    (io, status_log)
+}
+
 /// Feed one slot's hub terminal into the presenter's slot I/O: screen
 /// snapshot and output into `stdout`, presenter keystrokes and resizes back
 /// (after taking the input grant). 0141's terminal client and frames; the
@@ -2391,13 +2483,37 @@ async fn subscribe_terminal(
     terminal_id: TerminalId,
     mut pipes: SlotPipes,
     output: Arc<Mutex<SlotOutput>>,
+    status_log: crate::command::instance::feeds::SharedStatusLog,
     cancel: CancellationToken,
 ) {
-    let options = TerminalClientOptions::default();
+    // Queued-bytes gauge of this slot's output: at the budget, stop reading
+    // the stream so the hub resynchronises us (Lagged + Snapshot) instead of
+    // this task buffering without bound for a stalled presenter.
+    let gauge = output
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .tx
+        .clone();
+    // One lag notice per slot, kept across reconnects of the same emulator.
+    let mut lag_reported = false;
+    // The presenter slot's size, once it has sent one (kept across reconnects).
+    let mut viewer_size: Option<(u16, u16)> = None;
     let mut delay = RECONNECT_BACKOFF_INITIAL;
     let mut lost_at: Option<Instant> = None;
     let mut had_terminal_output = false;
+    // Bytes this slot's emulator already shows. History (WI 0105) is asked
+    // for only while it shows nothing, so a reconnect that keeps the
+    // emulator never replays scrollback twice.
+    let mut displayed = false;
     loop {
+        let options = TerminalClientOptions {
+            history: !displayed,
+            ..TerminalClientOptions::default()
+        };
+        let mut feed = crate::command::terminals::ReplayFeed::new();
+        if let Some((cols, rows)) = viewer_size {
+            feed.set_viewer_size(cols, rows);
+        }
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => return,
             stream = TerminalStream::connect_local(&address, &terminal_id, &options) => match stream {
@@ -2422,8 +2538,38 @@ async fn subscribe_terminal(
                     let _ = stream.close().await;
                     return;
                 }
-                frame = stream.next() => match frame {
-                    Ok(Some(TerminalFrame::Snapshot { screen, has_output, .. })) => {
+                _ = gauge.drained(), if gauge.over_budget() => {}
+                frame = stream.next(), if !gauge.over_budget() => match frame {
+                    Ok(Some(TerminalFrame::Lagged)) => {
+                        if !std::mem::replace(&mut lag_reported, true) {
+                            use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+                            crate::command::instance::feeds::StatusLogSink::new(status_log.clone())
+                                .write_message(UserMessage {
+                                    level: MessageLevel::Info,
+                                    text: crate::command::terminals::LAGGED_MESSAGE.into(),
+                                });
+                        }
+                    }
+                    Ok(Some(TerminalFrame::History { bytes, truncated })) => {
+                        // Same path as live output: the presenter's slot
+                        // pipeline parses (and filters) both.
+                        let mut out = Vec::new();
+                        if feed.history(&bytes, truncated, &mut crate::command::terminals::Unfiltered, &mut out) {
+                            use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+                            crate::command::instance::feeds::StatusLogSink::new(status_log.clone())
+                                .write_message(UserMessage {
+                                    level: MessageLevel::Info,
+                                    text: crate::command::terminals::TRUNCATED_MESSAGE.into(),
+                                });
+                        }
+                        if !out.is_empty() {
+                            displayed = true;
+                            if !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(out) {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Some(TerminalFrame::Snapshot { screen, has_output, cols, rows })) => {
                         // A pristine hub screen is metadata, not agent output.
                         // Feeding its ANSI redraw into the presenter would
                         // open a container overlay for commands with no PTY.
@@ -2431,12 +2577,18 @@ async fn subscribe_terminal(
                         // snapshot is authoritative after rebind or reconnect.
                         let redraw = has_output || had_terminal_output;
                         had_terminal_output |= has_output;
-                        if redraw && !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(screen) {
-                            return;
+                        let mut screen_bytes = Vec::new();
+                        feed.sized_snapshot(&screen, (cols, rows), &mut crate::command::terminals::Unfiltered, &mut screen_bytes);
+                        if redraw {
+                            displayed = true;
+                            if !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(screen_bytes) {
+                                return;
+                            }
                         }
                     }
                     Ok(Some(TerminalFrame::Output { bytes })) => {
                         had_terminal_output = true;
+                        displayed = true;
                         if !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(bytes) {
                             return;
                         }
@@ -2446,7 +2598,7 @@ async fn subscribe_terminal(
                         tracing::debug!(terminal = %terminal_id, code, "slot terminal refused an operation: {error}");
                     }
                     Ok(Some(TerminalFrame::ExecutionReplaced { .. })) => {}
-                    Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
+                    Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
                     Ok(None) | Err(_) => break,
                 },
                 bytes = pipes.stdin_rx.recv() => match bytes {
@@ -2457,6 +2609,8 @@ async fn subscribe_terminal(
                 },
                 size = pipes.resize_rx.recv() => {
                     if let Some((cols, rows)) = size {
+                        viewer_size = Some((cols, rows));
+                        feed.set_viewer_size(cols, rows);
                         let _ = stream.send(TerminalClientFrame::Resize { cols, rows }).await;
                     }
                 }
@@ -2566,6 +2720,9 @@ fn register_tab(
     let startup = match snapshot.slots.first() {
         Some(first) => {
             let (mut run, tab_feeds, slot_io) = new_run(feeds.clone());
+            // A run adopted from a snapshot may have been a Squad viewer; its
+            // origin is unknown here, so it keeps the reattach barrier.
+            run.squad_viewer = true;
             // The backbone (first) slot is the bound one, dormant or not.
             launch_slot(&shared.address, &mut run, first, false);
             if tab.in_group {
@@ -2847,6 +3004,9 @@ fn catch_up_run(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
         )
     {
         run.finished = true;
+        for waiter in run.finish_waiters.drain(..) {
+            let _ = waiter.send(Ok(()));
+        }
         let result = match &snapshot.execution_phase {
             ExecutionPhase::Error { message, .. } => Err(CommandError::Other(message.clone())),
             _ => Ok(CommandOutcome::Empty),

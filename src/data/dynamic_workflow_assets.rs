@@ -52,7 +52,72 @@ pub struct OverlayInventory {
     pub context: String,
 }
 
-/// Construct the squad evaluation-leader prompt.
+/// The image-recipe section of a directory task's leader prompt (WI 0105).
+pub const SQUAD_LEADER_IMAGE_RECIPES_MD: &str =
+    include_str!("../assets/dynamic/squad-leader-image-recipes.md");
+
+/// The task-owned image recipes a directory task's leader is told about,
+/// as container paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageRecipePrompt {
+    /// `/awman/context/workflow/Dockerfile.dev`.
+    pub project: String,
+    /// `(agent, /awman/context/workflow/.awman/Dockerfile.<agent>)`.
+    pub agents: Vec<(String, String)>,
+    /// A default task: `/workspace` and `/awman/context/workflow` are one
+    /// directory.
+    pub same_directory: bool,
+}
+
+impl ImageRecipePrompt {
+    /// The recipes under the task context mount `context_mount`.
+    pub fn at(context_mount: &str, agents: &[String], same_directory: bool) -> Self {
+        Self {
+            project: format!("{context_mount}/Dockerfile.dev"),
+            agents: agents
+                .iter()
+                .map(|agent| {
+                    (
+                        agent.clone(),
+                        format!("{context_mount}/.awman/Dockerfile.{agent}"),
+                    )
+                })
+                .collect(),
+            same_directory,
+        }
+    }
+
+    fn render(&self, repo_mount_path: &str) -> String {
+        let agents = if self.agents.is_empty() {
+            "- (no agent recipes are prepared for this task)".to_string()
+        } else {
+            self.agents
+                .iter()
+                .map(|(agent, path)| format!("- `{path}` — the `{agent}` agent image."))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let note = if self.same_directory {
+            format!(
+                "\nFor this task `{repo_mount_path}` and `/awman/context/workflow` are the same \
+                 directory, so the recipes are also visible under `{repo_mount_path}`; editing \
+                 them still only changes the images of the next run.\n"
+            )
+        } else {
+            String::new()
+        };
+        SQUAD_LEADER_IMAGE_RECIPES_MD
+            .replace("{{project_recipe}}", &self.project)
+            .replace("{{agent_recipes}}", &agents)
+            .replace("{{repo_mount_path}}", repo_mount_path)
+            .replace("{{same_directory_note}}", &note)
+    }
+}
+
+/// Construct the squad evaluation-leader prompt. `image_recipes` is `Some`
+/// only for a directory task, whose images are built from task-owned
+/// recipes; a Git-backed task's prompt has no recipe section.
+#[allow(clippy::too_many_arguments)]
 pub fn build_squad_leader_prompt(
     task_name: &str,
     task_description: &str,
@@ -61,8 +126,15 @@ pub fn build_squad_leader_prompt(
     overlays: &OverlayInventory,
     verdict_path: &str,
     guidance: Option<&[String]>,
+    image_recipes: Option<&ImageRecipePrompt>,
 ) -> String {
+    let recipes = image_recipes
+        .map(|recipes| format!("\n{}", recipes.render(repo_mount_path)))
+        .unwrap_or_default();
+    // Substituted first, so only awman's own text — never a task description
+    // that happens to contain the placeholder — becomes the section.
     SQUAD_LEADER_PROMPT_MD
+        .replace("{{image_recipes}}\n", &recipes)
         .replace("{{task_name}}", task_name)
         .replace("{{task_description}}", task_description)
         .replace("{{repo_mount_path}}", repo_mount_path)
@@ -191,5 +263,60 @@ mod identity_tests {
         assert!(prompt.contains("work item remote-1234567890abcdef12345678"));
         assert!(prompt.contains("/workspace/{{available_agents}}.md"));
         assert!(!prompt.contains("{{work_item_identity}}"));
+    }
+}
+
+#[cfg(test)]
+mod image_recipe_prompt_tests {
+    use super::*;
+
+    fn prompt(recipes: Option<&ImageRecipePrompt>) -> String {
+        build_squad_leader_prompt(
+            "t",
+            "describe {{image_recipes}} here",
+            "/workspace",
+            "- claude",
+            &OverlayInventory::default(),
+            "/awman/squad/run/verdict.json",
+            None,
+            recipes,
+        )
+    }
+
+    #[test]
+    fn directory_task_names_its_recipes_and_the_next_run_rule() {
+        let recipes = ImageRecipePrompt::at(
+            "/awman/context/workflow",
+            &["claude".into(), "codex".into()],
+            true,
+        );
+        let text = prompt(Some(&recipes));
+        assert!(text.contains("`/awman/context/workflow/Dockerfile.dev`"));
+        assert!(text.contains("`/awman/context/workflow/.awman/Dockerfile.claude`"));
+        assert!(text.contains("`/awman/context/workflow/.awman/Dockerfile.codex`"));
+        assert!(text.contains("at the start of the next run"));
+        assert!(text.contains("every step of\nthe workflow you generate keep the images"));
+        assert!(text.contains("visible immediately"));
+        assert!(text.contains("are the same directory"));
+        // The task's own text is data, never the section.
+        assert!(text.contains("describe {{image_recipes}} here"));
+        assert!(!text.contains("{{project_recipe}}") && !text.contains("{{agent_recipes}}"));
+        assert!(!text.contains("{{same_directory_note}}"));
+
+        let custom = prompt(Some(&ImageRecipePrompt::at(
+            "/awman/context/workflow",
+            &["claude".into()],
+            false,
+        )));
+        assert!(custom.contains("Dockerfile.dev"));
+        assert!(!custom.contains("are the same directory"));
+    }
+
+    #[test]
+    fn git_task_prompt_has_no_recipe_section() {
+        let text = prompt(None);
+        assert!(!text.contains("image recipes"));
+        assert!(!text.contains("Dockerfile.dev"));
+        assert!(!text.contains("{{image_recipes}}\n"));
     }
 }

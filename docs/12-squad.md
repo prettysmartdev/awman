@@ -280,10 +280,13 @@ Keys the task file omits are inherited from the repo and global files, so a task
 narrow its agent pool while keeping the standing `guidance` every task gets; see
 [Configuration: Per-task squad settings](07-configuration.md#per-task-squad-settings).
 
-Every agent in the pool gets a container image built automatically at the start
-of each run, before the leader launches — so the leader can pick any of them for
-a step of the workflow it generates without paying for a build mid-run. Images
-that already exist are not rebuilt.
+Every agent in the task's effective pool is prepared before the leader launches,
+so it can choose one for a workflow step without pausing later for image setup.
+On Docker and Apple Containers, fresh images are reused; stale or unlabelled
+images are rebuilt, and missing images are built. If a refresh of an existing
+image fails, the run keeps that image and records a stale-image warning. The
+warning is marked in run history and explained in the run detail. On importing
+runtimes, images are acquired from the configured source instead.
 
 ### Task workspaces
 
@@ -310,19 +313,39 @@ other awman mount-scope flow applies. This holds whether you answered the
 interview or passed `--workspace` on the command line; with `-n` the widening
 is refused outright instead of being asked about.
 
-A task whose workspace is a plain directory (the default workspace, or a
-custom folder that is not a Git repository) has no project of its own to build
-agent images from, so on its first run squad writes a `Dockerfile.dev` and a
-`.awman/Dockerfile.<agent>` into that directory from the same bundled
-templates `awman init` uses. Both are written only if absent: edit either one
-to control how the task's containers are built, and squad will leave your
-version alone from then on.
+A directory task uses a task-owned image context at
+`~/.awman/squad/tasks/<name>/workspace/`. This is the default task workspace
+itself, or, for a custom non-Git directory, the directory mounted in the
+container as `/awman/context/workflow`. Squad creates `Dockerfile.dev` and
+`.awman/Dockerfile.<agent>` there from its bundled templates when they are
+missing; existing recipe files are kept and can be edited in that directory.
+The custom directory remains mounted at `/workspace`, but squad does not write
+recipes there or use it as the image build context.
 
-Images built from a default task workspace are tagged with the task's own
-name — `awman-squad-<name>:latest` for the base image and
-`awman-squad-<name>-<agent>:latest` per agent — so two tasks never share or
-overwrite each other's images. (A custom workspace that is a repository uses
-the same folder-derived tags as any other awman project in that repository.)
+For a custom non-Git task, squad checks the old recipe locations in the custom
+directory once and copies safe, needed recipes and their local build inputs
+into the task-owned context when those destinations are absent. If a task-owned
+file already exists, it takes precedence and squad warns that the legacy file
+is no longer used. Unsupported or unsafe legacy `COPY` inputs stop preparation
+with guidance to move the recipe and its inputs into the task context. After
+this one-time migration, edits to legacy recipes in the custom directory have
+no effect. The migration checks recipes needed on its first run; if you add an
+agent later, create or copy its recipe into the task context. The new per-task
+image tags mean the first run after upgrading a custom non-Git task prepares its
+images again: Docker and Apple Containers build them, while builtin acquires
+them from its configured source. Old images are left in the runtime. Removing
+the task removes its task-owned recipes with the task.
+
+Edit recipes and their build inputs in the task context; changes take effect
+when the next run prepares its images. Squad does not refresh directory-task
+images again as part of that run's generated workflow, so edits made while a
+run is underway apply at the following run's preparation. The task-specific
+image tags are shared by runs of the same task, so another awman process using
+the same task name and data can still update a tag while a run is active.
+Directory-task images use task-specific tags, such as
+`awman-squad-<name>:latest` and `awman-squad-<name>-<agent>:latest`. A custom
+workspace that is a Git repository continues to use that repository's image
+context and tags.
 
 Whether the task uses the default workspace or a custom path, the durable
 task workspace is also available to its containers through the
@@ -739,12 +762,29 @@ the highlighted row. A task that has never run says so instead of showing an
 empty table. Like the detail modal, the history keeps refreshing from the daemon
 while it is open.
 
+While images are being built, the task card's outcome, task detail's last-run
+line, run-history row, and run-detail status show `building`. Once preparation
+finishes, the same run shows `running` until it ends. Reusing ready images does
+not show a building phase. A run that continues with a stale image has a `⚠`
+marker in the history; open its detail to read the image warning.
+
 **Enter** opens the highlighted run's detail on top of the table: its start
 and finish times, outcome, any unmet `env()` names, and the full reason and
 error text, wrapped to fit. When the text is longer than the modal, **↑ / ↓**
 and **PgUp / PgDn** scroll it. **Esc** goes back to the table with the same run
 still highlighted. A run that is still in progress updates in place when it
 finishes.
+
+When a run saved a workflow, its detail also shows that workflow's historical
+steps as a text DAG: setup, main steps grouped by stage, and teardown, with
+dependencies and recorded outcomes. Use **↑ / ↓** or **PgUp / PgDn** to scroll
+and **← / →** to pan a wide graph. A run that did not execute a workflow says
+so with `Workflow: This run did not execute a workflow.` If its saved workflow
+state is missing, unreadable, incompatible, or belongs to a different run, the
+detail says `Workflow state is no longer available for this run` or explains
+that the state could not be shown (unreadable, incompatible schema, or run
+identity mismatch). A failed workflow lookup is shown as `Workflow unavailable`
+with its error. These messages leave the run's reason and error visible.
 
 If one of these actions fails — the daemon rejects it, or it cannot reach the
 daemon at all — the reason is shown in red in the hint bar directly above the
@@ -768,6 +808,7 @@ reason any other card is.
 |--------|---------|
 | Grey | Paused |
 | Blue | A run is in progress right now |
+| Cyan | The run is building or refreshing an image |
 | Magenta | A [trigger](#triggering-a-task-now) is waiting for the next tick |
 | Red | The most recent run failed |
 | Yellow | Has never run |
@@ -778,7 +819,8 @@ last run failed, a running task is blue even if a trigger is pending, and a
 triggered task is magenta until the trigger is honoured. Every colour is also
 spelled out in the card's body (`Next: paused`, `Outcome: failed`,
 `Last run: —`, `Next: triggered — next tick`), so nothing depends on colour
-alone.
+alone. Cyan `building` is shown only while image preparation is doing a build;
+when preparation reuses images, the run proceeds without that phase.
 
 ### The squad indicator
 
@@ -856,14 +898,30 @@ Startup waiting and timeout messages appear in the visible hint bar above the
 command box. You can also type the CLI forms above in the command box to
 select a step or container or watch read-only.
 
+The TUI follows the selected task's current run, starting with its evaluation
+leader and continuing into the workflow that leader starts. It follows parallel
+workflow terminals as they appear and removes them when they exit. The follower
+is pinned to that run; it never switches to a later run of the same task.
+
 **Ctrl-\\** or **Ctrl-C** ends the local attachment, including while waiting.
 The next frame shows the same tab's task cards, with your selection retained.
-Task-list polling continues, and **a** reattaches to the still-running task.
-These detach keys are consumed locally and never sent to the agent. Starting
-another command also ends the old viewer.
+Task-list polling continues, and **a** starts a new follow of the still-running
+task. These detach keys are consumed locally and never sent to the agent.
+Starting another command also ends the old viewer.
 
 On ordinary tabs, **Ctrl-\\** minimizes the running command's container view;
 **Ctrl-M** restores it.
+
+Late attach replays up to the last 256 KiB of terminal output per agent
+terminal, subject to the viewer's own scrollback limit (10,000 lines by default
+in the TUI). When older bytes have been evicted, awman marks the history as
+truncated with the notice “earlier output was not retained; scrollback starts
+later”; the oldest retained bytes may be trimmed to a safe terminal boundary.
+The history is held in memory: a daemon restart loses it, and the run
+is recorded as interrupted. Redraw-heavy full-screen programs can produce noisy
+scrollback. If such a program is still on its alternate screen and replay is
+truncated, awman withholds replayed history and shows the current screen
+instead.
 
 All supported runtimes use the daemon terminal service for these viewers.
 Several viewers can watch a terminal, subject to its input-control rules.
