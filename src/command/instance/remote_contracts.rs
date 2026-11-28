@@ -473,6 +473,11 @@ async fn a_closed_dialogs_late_response_cannot_answer_the_next_dialog() {
         .poll()
         .iter()
         .any(|event| matches!(event, BackendEvent::DialogClosed { .. })));
+    assert!(
+        run.feeds.dialog_request_rx.try_recv().is_err(),
+        "the next dialog must stay deferred while the view handles the old close"
+    );
+    unit.backend.poll();
     let _ = run
         .feeds
         .dialog_request_rx

@@ -232,9 +232,43 @@ async fn final_review_reopens_while_the_agent_output_stays_available() {
             assert!(draw(&mut app, 100, 40).contains("Finish workflow"));
         }
     }
+    // Final review also outlives a naturally exited container. The retained
+    // command sender still has to reopen the board over its last output.
+    container.exited(0);
+    app.active_tab_mut().drain_container_slot_events();
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(answer_rx.try_recv().unwrap(), DialogResponse::Dismissed);
+    press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+    assert!(matches!(
+        requests_rx.try_recv().unwrap(),
+        EngineRequest::OpenControlBoard { .. }
+    ));
+    dialog_tx.send(request).unwrap();
+    app.poll_dialog_requests();
+    assert!(draw(&mut app, 100, 40).contains("Finish workflow"));
     press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(answer_rx.try_recv().unwrap(), DialogResponse::Char('f'));
     assert!(!app.active_tab().shared.command_cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn workflow_controls_open_over_the_queue_panel() {
+    use crate::engine::workflow::EngineRequest;
+
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::workflow_controls_open_over_the_queue_panel",
+    ));
+    let mut app = app(&s);
+    let (requests, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.active_tab_mut().engine_tx = Some(requests);
+    app.active_dialog = Some(Dialog::QueuePanel(Default::default()));
+
+    press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+    assert!(matches!(
+        requests_rx.try_recv().unwrap(),
+        EngineRequest::OpenControlBoard { .. }
+    ));
 }
 
 #[tokio::test]

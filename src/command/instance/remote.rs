@@ -951,18 +951,28 @@ impl InstanceBackend for RemoteInstanceBackend {
 
     fn poll(&self) -> Vec<BackendEvent> {
         let mut state = self.shared.lock();
+        let events: Vec<_> = state.events.drain(..).collect();
         for tab in &mut state.tabs {
             if let Some(run) = tab.run.as_mut() {
-                if run.dialog_close_barrier {
-                    while run.dialog_response_rx.try_recv().is_ok() {}
-                    run.dialog_close_barrier = false;
-                    while let Some((_, request)) = run.deferred_dialogs.pop_front() {
-                        let _ = run.dialog_request_tx.send(request);
-                    }
+                if !run.dialog_close_barrier {
+                    continue;
+                }
+                // The view must handle the close before the next dialog is
+                // released. Otherwise its close handler can consume the new
+                // board as the old, unread one and strand the workflow.
+                if events.iter().any(|event| {
+                    matches!(event, BackendEvent::DialogClosed { tab_id, .. } if tab_id == &tab.tab_id)
+                }) {
+                    continue;
+                }
+                while run.dialog_response_rx.try_recv().is_ok() {}
+                run.dialog_close_barrier = false;
+                while let Some((_, request)) = run.deferred_dialogs.pop_front() {
+                    let _ = run.dialog_request_tx.send(request);
                 }
             }
         }
-        state.events.drain(..).collect()
+        events
     }
 
     fn quit(&self) -> QuitPlan {

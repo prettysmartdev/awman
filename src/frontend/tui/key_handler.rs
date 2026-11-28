@@ -74,6 +74,14 @@ pub(super) fn focus_context(app: &App) -> FocusContext {
 /// keymap because they depend on *which* dialog is open, which the keymap's
 /// `FocusContext::Dialog` does not distinguish.
 fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    // Workflow controls have priority over local panels too. The generic
+    // keymap routes Ctrl-W to the active command once these panels yield it.
+    if key.code == KeyCode::Char('w')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && app.active_tab().engine_tx.is_some()
+    {
+        return false;
+    }
     if matches!(app.active_dialog, Some(Dialog::SquadTaskHistory(_))) {
         if let Some(Dialog::SquadTaskHistory(history)) = &mut app.active_dialog {
             if let Some(detail) = history.run_detail.as_mut() {
@@ -91,7 +99,7 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
             }
         }
     }
-    // The work-queue panel and the lease close prompt own every key.
+    // The work-queue panel and the lease close prompt own their other keys.
     if matches!(app.active_dialog, Some(Dialog::QueuePanel(_))) {
         queue::handle_panel_key(app, key);
         return true;
